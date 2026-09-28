@@ -710,11 +710,87 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
         return super().nbytes + self.indexer_nbytes
 
 
+class _BatchPooledBank:
+    """Completed QSA blocks of every row of a batch, each row anchored at its
+    first real token: ``keys[i, j]`` pools row ``i``'s tokens ``ratio * j`` to
+    ``ratio * j + ratio - 1`` counted from that token, exactly what a fresh
+    singleton cache over the row pools.
+
+    ``blocks[i]`` is row ``i``'s pooled watermark and ``tokens[i]`` a lower
+    bound on its length, kept so a rollback can clamp the watermark on the
+    host, as ``_QSAIndexerCache._trim_indexer`` does for a singleton. The
+    owning indexer is held weakly (it also keeps deepcopy of the cache cheap).
+    """
+
+    __slots__ = ("keys", "blocks", "tokens", "ratio", "tag")
+
+    def __init__(self, rows: int, ratio: int, tag: Any):
+        self.keys = None
+        self.blocks = [0] * rows
+        self.tokens = [0] * rows
+        self.ratio = ratio
+        self.tag = None if tag is None else weakref.ref(tag)
+
+    def owned_by(self, rows: int, ratio: int, tag: Any) -> bool:
+        return (
+            len(self.blocks) == rows
+            and self.ratio == ratio
+            and (self.tag is None if tag is None else self.tag is not None and self.tag() is tag)
+        )
+
+    def drop_tail(self, row: int, tokens: int) -> None:
+        """Row ``row`` lost its last ``tokens`` tokens; keep only intact blocks."""
+        self.tokens[row] = max(0, self.tokens[row] - int(tokens))
+        self.blocks[row] = min(self.blocks[row], self.tokens[row] // self.ratio)
+
+    def select(self, rows: list[int]) -> "_BatchPooledBank":
+        kept = _BatchPooledBank(len(rows), self.ratio, None)
+        kept.tag = self.tag
+        kept.blocks = [self.blocks[row] for row in rows]
+        kept.tokens = [self.tokens[row] for row in rows]
+        if self.keys is not None and rows:
+            kept.keys = self.keys[mx.array(rows, dtype=mx.int32)]
+        return kept
+
+    def join(self, other: Optional["_BatchPooledBank"], other_rows: int) -> "_BatchPooledBank":
+        """This bank's rows followed by ``other``'s (or ``other_rows`` empty rows)."""
+        if other is not None and not (
+            other.ratio == self.ratio and other.tag is not None and self.tag is not None
+            and other.tag() is self.tag()
+        ):
+            other = None
+        joined = _BatchPooledBank(len(self.blocks) + other_rows, self.ratio, None)
+        joined.tag = self.tag
+        joined.blocks = self.blocks + (other.blocks if other else [0] * other_rows)
+        joined.tokens = self.tokens + (other.tokens if other else [0] * other_rows)
+        parts = [self.keys, None if other is None else other.keys]
+        if any(part is not None for part in parts):
+            width = max(int(part.shape[1]) for part in parts if part is not None)
+            sample = next(part for part in parts if part is not None)
+            padded = []
+            for part, rows in zip(parts, (len(self.blocks), other_rows)):
+                if part is None:
+                    part = mx.zeros((rows, width, sample.shape[-1]), dtype=sample.dtype)
+                elif part.shape[1] < width:
+                    part = mx.pad(part, [(0, 0), (0, width - part.shape[1]), (0, 0)])
+                padded.append(part)
+            joined.keys = mx.concatenate(padded, axis=0)
+        return joined
+
+
 class BatchQSAKVCache:
     """Batch KV cache that keeps QSA raw keys and text/MRoPE positions aligned."""
 
     _omlx_mtp_batch_rollback_cache = True
     _omlx_mtp_verify_attention_cache = True
+
+    # Completed-block bank of every row (_BatchPooledBank). The batched indexer
+    # pools each row anchored at its first real token; the bank keeps those
+    # blocks across steps so a step pools only the blocks it completes. It is
+    # derived state, never serialized: every path that reassigns the raw bank
+    # through the public setters drops it, and the paths that keep row content
+    # (append, rollback, filter, extend) carry or clamp it explicitly.
+    _pooled_bank = None
 
     # Decode appends write into a capacity-backed buffer instead of
     # concatenating the whole raw-key bank every step. Each concatenate left
@@ -744,6 +820,7 @@ class BatchQSAKVCache:
     def index_keys(self, value):
         self._release_index_capacity()
         self._index_keys = value
+        self._pooled_bank = None
 
     @property
     def index_position_ids(self):
@@ -756,6 +833,7 @@ class BatchQSAKVCache:
     def index_position_ids(self, value):
         self._release_index_capacity()
         self._index_position_ids = value
+        self._pooled_bank = None
 
     def _release_index_capacity(self):
         """Collapse a managed buffer to its logical prefix before a plain set.
@@ -870,9 +948,117 @@ class BatchQSAKVCache:
         return self.index_keys, self.index_position_ids
 
     def prepare(self, **kwargs):
+        right_padding = kwargs.get("right_padding")
+        if right_padding is not None:
+            # Rows whose last right_padding[i] columns finalize() will roll into
+            # their left padding: speculative tokens a vector rollback rejects,
+            # or the padding of a right-padded prompt that is appended in
+            # between. Kept on the host for the bank.
+            self._pending_right_padding = [int(value) for value in right_padding]
         self.kv_cache.prepare(**kwargs)
 
+    def pooled_indexer_rows(
+        self,
+        paddings: list[int],
+        compress_ratio: int,
+        index_key_norm,
+        apply_index_rope,
+        *,
+        cache_tag=None,
+        rows: Optional[list[int]] = None,
+    ) -> mx.array:
+        """Completed-block bank ``[B, blocks, D]`` of every row (or ``rows``),
+        row ``i``'s real tokens starting at column ``paddings[i]``: the blocks
+        a fresh singleton cache over ``index_keys[i, paddings[i]:]`` would
+        pool, left-aligned per row and zero past each row's own count. Only
+        blocks completed since the previous call are pooled."""
+
+        batch = int(self._index_keys.shape[0])
+        bank = self._pooled_bank
+        if bank is None or not bank.owned_by(batch, compress_ratio, cache_tag):
+            bank = self._pooled_bank = _BatchPooledBank(batch, compress_ratio, cache_tag)
+        positions = self.index_position_ids
+        needed = 0
+        for row in range(batch) if rows is None else rows:
+            padding = paddings[row]
+            tokens = self.index_offset - padding
+            complete = tokens // compress_ratio
+            needed = max(needed, complete)
+            # The row only grew since the watermark was set, or a rollback
+            # already clamped it; either way blocks below it are intact.
+            start = min(bank.blocks[row], complete)
+            bank.tokens[row] = tokens
+            bank.blocks[row] = complete
+            if start == complete:
+                continue
+            begin = padding + start * compress_ratio
+            end = padding + complete * compress_ratio
+            pooled = pool_completed_index_keys(
+                self.index_keys[row : row + 1, begin:end],
+                (
+                    positions[:, row : row + 1, begin:end]
+                    if positions.ndim == 3
+                    else positions[row : row + 1, begin:end]
+                ),
+                compress_ratio=compress_ratio,
+                index_key_norm=index_key_norm,
+                apply_index_rope=apply_index_rope,
+            )
+            capacity = 0 if bank.keys is None else int(bank.keys.shape[1])
+            if complete > capacity:
+                grown = mx.zeros(
+                    (
+                        batch,
+                        _ladder_capacity(
+                            complete, max(1, self.index_step // compress_ratio)
+                        ),
+                        pooled.shape[-1],
+                    ),
+                    dtype=pooled.dtype,
+                )
+                if capacity:
+                    grown[:, :capacity] = bank.keys
+                bank.keys = grown
+            bank.keys[row : row + 1, start:complete] = pooled
+        if bank.keys is None:
+            return mx.zeros(
+                (batch, 0, self._index_keys.shape[-1]), dtype=self._index_keys.dtype
+            )
+        return bank.keys[:, :needed]
+
+    def row_pooled_indexer_keys(
+        self,
+        row: int,
+        paddings: list[int],
+        compress_ratio: int,
+        index_key_norm,
+        apply_index_rope,
+        *,
+        cache_tag=None,
+    ) -> mx.array:
+        """Row ``row``'s completed-block bank ``[1, blocks, D]`` (see
+        :meth:`pooled_indexer_rows`)."""
+
+        self.pooled_indexer_rows(
+            paddings,
+            compress_ratio,
+            index_key_norm,
+            apply_index_rope,
+            cache_tag=cache_tag,
+            rows=[row],
+        )
+        return self._pooled_bank.keys[row : row + 1, : self._pooled_bank.blocks[row]]
+
     def finalize(self):
+        dropped = getattr(self, "_pending_right_padding", None)
+        self._pending_right_padding = None
+        if dropped is not None and self._pooled_bank is not None:
+            # Each row's last dropped[i] columns leave it. Content before them
+            # keeps its place relative to the row's first real token, so only
+            # blocks reaching into them are pooled again.
+            for row, tokens in enumerate(dropped):
+                if tokens:
+                    self._pooled_bank.drop_tail(row, tokens)
         right_padding = getattr(self.kv_cache, "_right_padding", None)
         self.kv_cache.finalize()
         if right_padding is None or self.index_keys is None:
@@ -937,6 +1123,10 @@ class BatchQSAKVCache:
             self._index_position_ids = new_positions
             self._index_capacity_managed = True
             self.index_offset = length
+            # Banks are anchored at each row's first real token, so the
+            # min_left shift leaves them valid; they follow their rows.
+            if self._pooled_bank is not None:
+                self._pooled_bank = self._pooled_bank.select(kept)
             return
         self.index_keys = self.index_keys[batch_indices]
         if self.index_position_ids.ndim == 3:
@@ -1079,6 +1269,13 @@ class BatchQSAKVCache:
             self._index_position_ids = positions
             self._index_capacity_managed = True
             self.index_offset = target
+            # Left-padding to the join width keeps every row's content in
+            # place relative to its first real token, so both sides' banks
+            # stay valid.
+            if self._pooled_bank is not None:
+                self._pooled_bank = self._pooled_bank.join(
+                    other._pooled_bank, int(right[0].shape[0])
+                )
             return
         self.index_keys = mx.concatenate([left[0], right[0]], axis=0)
         self.index_position_ids = mx.concatenate(
@@ -1201,6 +1398,9 @@ class BatchQSAKVCache:
     def trim(self, n):
         trimmed = self.kv_cache.trim(n)
         self.index_offset = max(0, self.index_offset - trimmed)
+        if trimmed and self._pooled_bank is not None:
+            for row in range(len(self._pooled_bank.blocks)):
+                self._pooled_bank.drop_tail(row, trimmed)
         if self._index_capacity_managed:
             # The managed buffer is addressed by index_offset; the stale draft
             # columns past it are overwritten by the next update_indexer.
@@ -1243,6 +1443,8 @@ class BatchQSAKVCache:
         extra = 0
         if self._index_keys is not None:
             extra = self._index_keys.nbytes + self._index_position_ids.nbytes
+        if self._pooled_bank is not None and self._pooled_bank.keys is not None:
+            extra += self._pooled_bank.keys.nbytes
         return self.kv_cache.nbytes + extra
 
 
@@ -1344,6 +1546,10 @@ _EAGER_DISPATCH_EVERY = _eager_dispatch_every()
 _EAGER_DISPATCH_WARMUP = 6
 # Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
 _GATHERED_VERIFY_DISABLED = not env_enabled("OMLX_QWEN4_QSA_GATHERED_VERIFY")
+# The batched indexer keeps each row's completed-block bank across steps and
+# pools only new blocks (OMLX_QWEN4_QSA_BATCH_ROW_BANKS=0 re-pools every row's
+# whole history each step through a fresh singleton cache; same masks).
+_BATCH_ROW_BANKS_ENABLED = env_enabled("OMLX_QWEN4_QSA_BATCH_ROW_BANKS")
 # Row-exact Lightning MTP verify rows on the masked QSA arm score and select
 # blocks and run SDPA per row with the serial decode kernels
 # (OMLX_QWEN4_QSA_MASKED_VERIFY=0 keeps the multi-row mask and MLX SDPA).
@@ -1525,9 +1731,19 @@ class Qwen4ExpQSAIndexer(nn.Module):
         ):
             # Block pooling is anchored at each request's first real token,
             # not at column zero of the left-padded batch.
+            paddings = cache.left_padding.tolist()
+            if (
+                _BATCH_ROW_BANKS_ENABLED
+                and cache.index_keys is not None
+                and cache.index_keys.dtype == qk.dtype
+                and cache.index_offset == cache._idx
+                and max(paddings) <= cache.index_offset
+            ):
+                # Every row already has its first real token in the bank.
+                return self._batch_row_masks(qk, cache, position_ids, paddings)
             row_masks = []
             key_length = cache.index_offset + seq_len
-            for i, padding in enumerate(cache.left_padding.tolist()):
+            for i, padding in enumerate(paddings):
                 input_padding = min(seq_len, max(0, padding - cache.index_offset))
                 width = max(0, key_length - padding)
                 if input_padding == seq_len:
@@ -1610,8 +1826,20 @@ class Qwen4ExpQSAIndexer(nn.Module):
                 index_key_norm=self.k_layernorm,
                 apply_index_rope=self._apply_rope,
             )
-        pooled_keys = mx.expand_dims(pooled_keys, axis=1)
+        return self._pooled_selection_mask(query, pooled_keys, past_len, key_len)
 
+    def _pooled_selection_mask(
+        self,
+        query: mx.array,
+        pooled_keys: mx.array,
+        past_len: int,
+        key_len: int,
+    ) -> mx.array:
+        """Selection mask of normalized, rotated ``query`` ``[B, heads, L, D]``
+        against the completed-block bank ``[B, blocks, D]`` of ``key_len`` keys."""
+
+        batch, _, seq_len, _ = query.shape
+        pooled_keys = mx.expand_dims(pooled_keys, axis=1)
         # Score in float32, as the reference does: which blocks win is a discrete
         # choice, and rounding the products flips the ones near the cut-off.
         scores = query.astype(mx.float32) @ pooled_keys.astype(mx.float32).transpose(
@@ -1619,7 +1847,60 @@ class Qwen4ExpQSAIndexer(nn.Module):
         )
         if batch == 1 and seq_len == 1 and past_len == key_len - 1:
             return self.aligned_row_mask(scores, key_len)
-        return self._selection_mask(scores, past_len, key_len, max_complete_blocks)
+        return self._selection_mask(
+            scores, past_len, key_len, key_len // self.compress_ratio
+        )
+
+    def _batch_row_masks(
+        self,
+        qk: mx.array,
+        cache: "BatchQSAKVCache",
+        position_ids: mx.array,
+        paddings: list[int],
+    ) -> mx.array:
+        """The per-row masks of the batched branch below, from each row's
+        persistent completed-block bank instead of a fresh singleton cache.
+
+        Appending first and then reading row ``i`` at ``padding:`` sees exactly
+        the keys and positions the fresh row cache held after its own append,
+        and the bank pools the same blocks, so each mask is the same.
+        """
+
+        batch, seq_len, _ = qk.shape
+        qk = qk.reshape(batch, seq_len, self.n_heads + self.kv_heads, self.head_dim)
+        cache.update_indexer(qk[:, :, self.n_heads :].squeeze(2), position_ids)
+        key_length = cache.index_offset
+        row_masks = []
+        for i, padding in enumerate(paddings):
+            width = key_length - padding
+            if width // self.compress_ratio <= self.block_topk:
+                ends = width - seq_len + mx.arange(seq_len) + 1
+                row_mask = (mx.arange(width)[None, :] < ends[:, None])[None, None]
+            else:
+                query = self.q_layernorm(qk[i : i + 1, :, : self.n_heads]).transpose(
+                    0, 2, 1, 3
+                )
+                query = self._apply_rope(
+                    query,
+                    (
+                        position_ids[:, i : i + 1]
+                        if position_ids.ndim == 3
+                        else position_ids[i : i + 1]
+                    ),
+                )
+                pooled_keys = cache.row_pooled_indexer_keys(
+                    i,
+                    paddings,
+                    self.compress_ratio,
+                    self.k_layernorm,
+                    self._apply_rope,
+                    cache_tag=self,
+                )
+                row_mask = self._pooled_selection_mask(
+                    query, pooled_keys, width - seq_len, width
+                )
+            row_masks.append(mx.pad(row_mask, [(0, 0), (0, 0), (0, 0), (padding, 0)]))
+        return mx.concatenate(row_masks, axis=0)
 
     def aligned_row_mask(self, scores: mx.array, key_len: int) -> mx.array:
         """Token mask of one batch-one row whose query is the last of its
