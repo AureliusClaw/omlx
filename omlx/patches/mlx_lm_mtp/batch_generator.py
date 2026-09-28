@@ -50,6 +50,13 @@ def _set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
 
 
 _ROW_EXACT_DISABLED = os.environ.get("OMLX_MTP_ROW_EXACT_VERIFY", "1").strip() == "0"
+# Multi-request Lightning MTP. OMLX_MTP_MULTI_REQUEST=0 keeps batches of two or
+# more requests on ordinary decode while a request running alone still
+# speculates: at long context a batched verify cycle's rollback and the
+# batch's MTP/standard reconciles can cost more than speculation returns.
+_MULTI_REQUEST_DISABLED = os.environ.get(
+    "OMLX_MTP_MULTI_REQUEST", "1"
+).strip().lower() in {"0", "false", "no", "off"}
 
 
 def _row_exact_verify(model: Any) -> bool:
@@ -674,6 +681,8 @@ def _is_mtp_eligible(gen_batch: Any) -> bool:
 
 def _model_supports_batch_mtp(model: Any) -> bool:
     """Only validated model adapters opt into multi-request Lightning MTP."""
+    if _MULTI_REQUEST_DISABLED:
+        return False
     return any(
         getattr(host, "_omlx_mtp_multi_request", False) is True
         for host in (
