@@ -14,10 +14,9 @@ from __future__ import annotations
 
 import mlx.core as mx
 import pytest
+from test_qwen4_qsa_batch_row_banks import _config, _ragged_rollback
 
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
-
-from test_qwen4_qsa_batch_row_banks import _config, _ragged_rollback
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +47,9 @@ class _Pair:
         self.attention = self.language.Qwen4ExpAttention(self.config)
         mx.eval(self.attention.parameters())
         mx.random.seed(seed)
-        self.inputs = [mx.random.normal((1, n, self.config.hidden_size)) for n in prefixes]
+        self.inputs = [
+            mx.random.normal((1, n, self.config.hidden_size)) for n in prefixes
+        ]
         self.fast = self.language.BatchQSAKVCache.merge(self.rows())
         self.reference = self.language.BatchQSAKVCache.merge(self.rows())
         self.calls = []
@@ -69,7 +70,9 @@ class _Pair:
         return rows
 
     def forward(self, cache, x, gathered, target_verify=False, positions="none"):
-        self.monkeypatch.setattr(self.language, "_GATHERED_BATCH_DISABLED", not gathered)
+        self.monkeypatch.setattr(
+            self.language, "_GATHERED_BATCH_DISABLED", not gathered
+        )
         batch, length = x.shape[:2]
         mask = self.language._create_qwen3_5_attention_mask(x, cache)
         position_ids = None
@@ -79,7 +82,11 @@ class _Pair:
                 (3, batch, length),
             )
         out = self.attention(
-            x, mask=mask, cache=cache, position_ids=position_ids, target_verify=target_verify
+            x,
+            mask=mask,
+            cache=cache,
+            position_ids=position_ids,
+            target_verify=target_verify,
         )
         mx.eval(out)
         return out
@@ -92,7 +99,9 @@ class _Pair:
         assert len(self.calls) == before + 1, "the gathered batch arm did not run"
         expected = self.forward(self.reference, x, False, target_verify, positions)
         assert len(self.calls) == before + 1
-        assert actual.shape == expected.shape == (batch, length, self.config.hidden_size)
+        assert (
+            actual.shape == expected.shape == (batch, length, self.config.hidden_size)
+        )
         assert mx.allclose(actual, expected, rtol=tol, atol=tol).item()
         self.assert_same_state()
         return actual
@@ -185,7 +194,9 @@ def test_kill_switches_keep_the_dense_path(monkeypatch):
         monkeypatch.setattr(language, "_BATCH_ROW_BANKS_ENABLED", True)
         monkeypatch.setattr(language, switch, switch == "_GATHERED_BATCH_DISABLED")
         assert (
-            pair.attention._gathered_batch_paddings(x, mask, pair.fast, None, None, False)
+            pair.attention._gathered_batch_paddings(
+                x, mask, pair.fast, None, None, False
+            )
             is None
         )
 
@@ -198,8 +209,12 @@ def test_eligibility_fails_closed(monkeypatch):
     decode = mx.zeros((batch, 1, pair.config.hidden_size))
     marker = language._create_qwen3_5_attention_mask(decode, cache)
 
-    def paddings(x=decode, mask=marker, c=cache, positions=None, embeddings=None, verify=False):
-        return attention._gathered_batch_paddings(x, mask, c, positions, embeddings, verify)
+    def paddings(
+        x=decode, mask=marker, c=cache, positions=None, embeddings=None, verify=False
+    ):
+        return attention._gathered_batch_paddings(
+            x, mask, c, positions, embeddings, verify
+        )
 
     assert paddings() == cache.left_padding.tolist()
     # Narrow non-verify windows stay dense, exactly as for a batch-one row.
@@ -215,7 +230,9 @@ def test_eligibility_fails_closed(monkeypatch):
     assert paddings(mask=mx.ones((batch, 1, 1, cache._idx + 1), dtype=mx.bool_)) is None
     assert paddings(embeddings=(mx.zeros((1,)), mx.zeros((1,)))) is None
     # Prefill-width windows keep the dense path.
-    wide = mx.zeros((batch, language._GATHERED_BATCH_MAX_QUERY + 1, pair.config.hidden_size))
+    wide = mx.zeros(
+        (batch, language._GATHERED_BATCH_MAX_QUERY + 1, pair.config.hidden_size)
+    )
     assert paddings(x=wide, mask=None, verify=True) is None
     # Row-exact verify keeps its own arms.
     monkeypatch.setattr(language, "_row_exact_verify_armed", lambda: True)
@@ -233,4 +250,7 @@ def test_rows_below_the_crossover_keep_the_dense_path(monkeypatch):
     monkeypatch.setattr(pair.language, "_GATHERED_BATCH_DISABLED", False)
     x = mx.zeros((2, 1, pair.config.hidden_size))
     mask = pair.language._create_qwen3_5_attention_mask(x, pair.fast)
-    assert pair.attention._gathered_batch_paddings(x, mask, pair.fast, None, None, False) is None
+    assert (
+        pair.attention._gathered_batch_paddings(x, mask, pair.fast, None, None, False)
+        is None
+    )
