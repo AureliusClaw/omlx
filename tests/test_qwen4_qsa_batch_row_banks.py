@@ -107,9 +107,7 @@ class _Pair:
         x = mx.random.normal((batch, length, self.config.hidden_size))
         outputs = []
         for enabled, cache in ((True, self.fast), (False, self.reference)):
-            self.monkeypatch.setattr(
-                self.language, "_BATCH_ROW_BANKS_ENABLED", enabled
-            )
+            self.monkeypatch.setattr(self.language, "_BATCH_ROW_BANKS_ENABLED", enabled)
             mask = self.language._create_qwen3_5_attention_mask(x, cache)
             position_ids = None
             if positions == "mrope":
@@ -198,9 +196,7 @@ def _assert_bank_kept(pair):
 
 
 @pytest.mark.parametrize("positions", ["none", "mrope"])
-def test_banks_match_fresh_row_caches_through_a_running_batch(
-    monkeypatch, positions
-):
+def test_banks_match_fresh_row_caches_through_a_running_batch(monkeypatch, positions):
     language, pair = _setup(monkeypatch)
     for _ in range(3):
         pair.step(positions=positions)
@@ -308,9 +304,7 @@ def test_right_padded_prompt_prefill_keeps_banks_exact(monkeypatch):
     language, pair = _setup(monkeypatch, prefixes=(4, 4))
     lengths = (23, 9)
     width = max(lengths)
-    prompts = [
-        mx.random.normal((1, n, pair.config.hidden_size)) for n in lengths
-    ]
+    prompts = [mx.random.normal((1, n, pair.config.hidden_size)) for n in lengths]
     padded = mx.concatenate(
         [mx.pad(p, [(0, 0), (0, width - p.shape[1]), (0, 0)]) for p in prompts]
     )
