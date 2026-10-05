@@ -33,10 +33,7 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx/admin/static/js/dashboard.
         assert.equal(vm.runInNewContext(condition, {selectedModel:{moe_expert_offload_supported:supported}}), supported === true);
     }
     for (const key of ['mtp_enabled', 'vlm_mtp_enabled', 'dflash_enabled']) {
-        // The template's disabled bindings reference selectedModel
-        // (moe_offload_allows_mtp); null mirrors the Vue default before a
-        // model is picked, so `selectedModel?.moe_offload_allows_mtp` is
-        // falsy and the mtp conflict term behaves as on a non-MoE model.
+        // The disabled bindings also read selectedModel.
         const scope = {modelSettings: {[enabled]:false, [key]:true}, selectedModel: null};
         assert.equal(vm.runInNewContext(offload.match(/:disabled="([^"]+)"/)[1], scope), true);
         const lines = html.split('\n');

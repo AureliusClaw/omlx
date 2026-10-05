@@ -93,8 +93,7 @@ class MockTokenizer:
             tokens.append(self.bos_token_id)
         # Simulate tokenization by splitting on spaces
         for i, word in enumerate(text.split()):
-            # Deterministic across processes (PYTHONHASHSEED randomizes
-            # built-in hash(), which would break cross-process comparisons).
+            # crc32, unlike hash(), is stable across processes.
             token_id = (zlib.crc32(word.encode()) % (self.vocab_size - 10)) + 10
             tokens.append(token_id)
         return tokens

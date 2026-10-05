@@ -391,9 +391,7 @@ def add_host_key(
 ) -> bool:
     """Add a host key to known_hosts."""
 
-    # Same discipline as pin_enrolled_host_key(): both fields land verbatim
-    # in a known_hosts line, so whitespace in the hostname or an embedded
-    # newline anywhere would let a caller forge additional entries.
+    # Both fields go verbatim into a known_hosts line; block injected entries.
     hostname = validate_ssh_target(hostname)
     if "@" in hostname:
         hostname = hostname.rsplit("@", 1)[1]
