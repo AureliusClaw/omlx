@@ -26,6 +26,7 @@ from omlx.exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
 )
+from omlx.model_settings import ModelSettings
 from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
     Qwen4ExpResidencyEstimate,
 )
@@ -1630,6 +1631,26 @@ class TestEnginePoolAsync:
         assert any(
             "no draft model is set" in r.getMessage()
             for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_dflash_bare_draft_name_resolves_to_local_path(
+        self, pool_with_mock_engines
+    ):
+        pool = pool_with_mock_engines
+        engine = MagicMock()
+        engine.start = AsyncMock()
+
+        with patch("omlx.engine.dflash.DFlashEngine", return_value=engine) as load:
+            await pool.get_engine(
+                "model-a",
+                runtime_settings=ModelSettings(
+                    dflash_enabled=True, dflash_draft_model="model-b"
+                ),
+            )
+
+        assert load.call_args.kwargs["draft_model_path"] == (
+            pool.get_entry("model-b").model_path
         )
 
     @pytest.mark.asyncio

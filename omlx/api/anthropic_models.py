@@ -8,16 +8,9 @@ These models define the request and response schemas for:
 - Tool calling in Anthropic format
 """
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args
 
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Discriminator,
-    Field,
-    Tag,
-    model_validator,
-)
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
 
 from omlx.api.shared_models import IDPrefix, generate_id
 
@@ -92,47 +85,14 @@ class ContentBlockInputAudio(BaseModel):
 
 
 class ContentBlockUnknown(BaseModel):
-    """Forward-compat catch-all for content block types not otherwise modeled.
-
-    Claude Code emits blocks such as ``tool_addition`` (with a nested
-    ``tool_reference``) when deferred/MCP tools load mid-session. The
-    converters in ``anthropic_utils`` already skip unrecognized blocks, so
-    accepting one here keeps the rest of the conversation working instead of
-    failing the whole request with 422 (issue #3754).
-
-    Only reached via :data:`_content_block_tag`, which routes *unknown* ``type``
-    values here. Malformed blocks of a *known* type still fail validation.
-    """
+    """Content block type this server does not model. Converters skip it."""
 
     type: str
     model_config = ConfigDict(extra="allow")
 
 
-# Every ``type`` value that has a strictly-validated model above. Anything else
-# routes to ContentBlockUnknown.
-_KNOWN_CONTENT_BLOCK_TYPES: frozenset[str] = frozenset(
-    {
-        "text",
-        "image",
-        "tool_use",
-        "tool_result",
-        "thinking",
-        "document",
-        "input_audio",
-    }
-)
-
-# Sentinel tag for blocks that carry no usable ``type`` at all.
-_UNSET_TYPE_TAG = "untyped"
-
-# The pre-#3754 union, kept verbatim and still reachable. Every variant above
-# declares ``type: Literal[...] = "..."`` with a default, so this smart union
-# inferred the type from the remaining fields: a payload with no ``type`` key
-# still validated as whichever model its shape fit. Retiring that leniency is
-# not part of #3754, so ``_content_block_tag`` sends untyped blocks here instead
-# of rejecting them, reusing the original inference rather than reimplementing
-# it.
-_LegacyContentBlock = (
+# A block without `type` keeps the smart-union inference over the typed models.
+_UntypedContentBlock = (
     ContentBlockText
     | ContentBlockImage
     | ContentBlockToolUse
@@ -141,35 +101,26 @@ _LegacyContentBlock = (
     | ContentBlockDocument
     | ContentBlockInputAudio
 )
+_KNOWN_CONTENT_BLOCK_TYPES = frozenset(
+    cls.model_fields["type"].default for cls in get_args(_UntypedContentBlock)
+)
 
 
 def _content_block_tag(value: Any) -> str:
-    """Callable discriminator: known ``type`` -> its strict model, else catch-all.
-
-    A plain union plus a catch-all (``union_mode="left_to_right"``) would let a
-    *malformed* known block such as ``{"type": "text"}`` (no ``text`` field)
-    fall through and validate. The converter then does ``block_dict.get("text",
-    "")``, so the client gets a 200 with a silently degraded prompt instead of a
-    422 naming the bad field. Routing on ``type`` first keeps that 422.
-
-    Blocks with no usable ``type`` (missing, null, empty or non-string) take the
-    ``_UNSET_TYPE_TAG`` branch, which is the original union, so they keep
-    validating exactly as they did before this fix.
-    """
     if isinstance(value, dict):
         block_type = value.get("type")
     else:
         block_type = getattr(value, "type", None)
     if not isinstance(block_type, str) or not block_type:
-        return _UNSET_TYPE_TAG
+        return "untyped"
     if block_type in _KNOWN_CONTENT_BLOCK_TYPES:
         return block_type
     return "unknown"
 
 
-# Union type for all content blocks
+# Known types validate strictly. Unknown types are accepted and then ignored.
 ContentBlock = Annotated[
-    Annotated[_LegacyContentBlock, Tag(_UNSET_TYPE_TAG)]
+    Annotated[_UntypedContentBlock, Tag("untyped")]
     | Annotated[ContentBlockText, Tag("text")]
     | Annotated[ContentBlockImage, Tag("image")]
     | Annotated[ContentBlockToolUse, Tag("tool_use")]
