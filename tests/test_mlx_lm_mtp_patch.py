@@ -82,7 +82,9 @@ class TestCacheRollback:
 
 class TestMtpBoundaryCommit:
     @staticmethod
-    def _run_full_accept_cycle(monkeypatch, *, emitted, drafts, clamp=None):
+    def _run_full_accept_cycle(
+        monkeypatch, *, emitted, drafts, clamp=None, context_copy=None
+    ):
         import mlx.core as mx
 
         from omlx.patches.mlx_lm_mtp import batch_generator as bg
@@ -104,6 +106,8 @@ class TestMtpBoundaryCommit:
             drafts=mx.array(draft_ids, dtype=mx.uint32),
             draft_lps=[mx.zeros((32,)) for _ in draft_ids],
         )
+        if context_copy is not None:
+            state.context_copy = context_copy
 
         def logits_for(targets):
             rows = []
@@ -180,6 +184,29 @@ class TestMtpBoundaryCommit:
         assert emitted_sources[-1] == boundary_source
         assert len(batch.tokens[0]) == 4
         assert cache.offset == 4
+
+    def test_boundary_emit_replaces_copied_drafts(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+        copier = SimpleNamespace(
+            extend=lambda history, committed: False,
+            propose=lambda limit: [1, 2],
+            observe=lambda accepted, drafted=None: None,
+        )
+        original = bg._materialize_mtp_boundary_emit
+        copy_labels = []
+
+        def materialize(batch, state):
+            copy_labels.append(state.copy_drafts)
+            original(batch, state)
+
+        monkeypatch.setattr(bg, "_materialize_mtp_boundary_emit", materialize)
+        _batch, state, _cache = self._run_full_accept_cycle(
+            monkeypatch, emitted=2, drafts=1, context_copy=copier
+        )
+
+        assert copy_labels == [True]
+        assert state.copy_drafts is False
 
 
 class TestQwen35Model:

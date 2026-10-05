@@ -4394,6 +4394,8 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
     mx.eval(next_tok)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
+    # The drafts below replace any copied window.
+    state.copy_drafts = False
     t0 = time.perf_counter()
     if drafter is not None:
         drafter.draft([(gen_batch, state, captured, next_tok, prev_buf)])
