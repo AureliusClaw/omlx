@@ -115,7 +115,7 @@ final class AppUpdaterTests: XCTestCase {
         return process.terminationStatus
     }
 
-    func testVerifyAppSignatureAcceptsAdHocSignedBundle() throws {
+    func testVerifyAppSignatureRejectsAdHocSignedBundle() throws {
         let appURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("omlx-update-test-signed-\(UUID().uuidString).app")
         try makeAppBundle(at: appURL)
@@ -123,7 +123,13 @@ final class AppUpdaterTests: XCTestCase {
 
         XCTAssertEqual(codesign(["-f", "-s", "-", appURL.path]), 0, "test setup: ad-hoc sign failed")
 
-        try makeUpdater().verifyAppSignature(at: appURL.path)
+        XCTAssertThrowsError(
+            try makeUpdater().verifyAppSignature(at: appURL.path)
+        ) { error in
+            guard case AppUpdater.UpdateError.signatureInvalid = error else {
+                return XCTFail("expected signatureInvalid, got \(error)")
+            }
+        }
     }
 
     func testVerifyAppSignatureRejectsUnsignedBundle() throws {
