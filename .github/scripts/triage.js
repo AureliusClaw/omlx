@@ -6,6 +6,9 @@ const IDEAS_URL = 'https://github.com/jundot/omlx/discussions/categories/ideas';
 
 const TRUSTED_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR', 'CONTRIBUTOR']);
 const LARGE_PR_LINES = 1000;
+// The large PR rule applies to PRs opened after the policy announcement.
+const LARGE_PR_SINCE = Date.parse('2026-10-05T00:00:00Z');
+const LARGE_PR_MARKER = '<!-- omlx-triage:large-pr -->';
 const DRAFT_IDLE_DAYS = 30;
 const CONFLICT_IDLE_DAYS = 30;
 const PR_IDLE_DAYS = 60;
@@ -22,7 +25,8 @@ const LARGE_PR_MESSAGE =
   `so the approach can be checked before review ([CONTRIBUTING.md](${CONTRIBUTING_URL})). ` +
   'It has been moved to draft for now. ' +
   `Please open an issue or an [Ideas](${IDEAS_URL}) discussion and link it here. ` +
-  'Once the approach is agreed, mark it ready for review.';
+  'Once the approach is agreed, mark it ready for review.\n\n' +
+  LARGE_PR_MARKER;
 
 const PR_CLOSE_REASONS = {
   conflict: `Closing this PR because it has merge conflicts and no new commits for over ${CONFLICT_IDLE_DAYS} days.`,
@@ -39,7 +43,7 @@ query($owner: String!, $repo: String!, $cursor: String) {
     pullRequests(states: OPEN, first: 50, after: $cursor) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        number isDraft mergeable authorAssociation
+        id number isDraft mergeable authorAssociation createdAt additions deletions
         author { __typename login }
         labels(first: 20) { nodes { name } }
         commits(last: 1) { nodes { commit { committedDate } } }
@@ -63,27 +67,9 @@ query($owner: String!, $repo: String!, $cursor: String) {
   }
 }`;
 
-const PR_LINKS_QUERY = `
-query($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      closingIssuesReferences(first: 20) { nodes { number state labels(first: 20) { nodes { name } } } }
-    }
-  }
-}`;
-
 const MERGEABLE_QUERY = `
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) { pullRequest(number: $number) { mergeable } }
-}`;
-
-const ISSUE_OPEN_PRS_QUERY = `
-query($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) {
-    issue(number: $number) {
-      closedByPullRequestsReferences(first: 20, includeClosedPrs: false) { nodes { number } }
-    }
-  }
 }`;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -138,33 +124,20 @@ module.exports = async ({ github, context, core }) => {
     await sleep(WRITE_INTERVAL_MS);
   }
 
-  async function onPullRequest() {
-    const { action, pull_request: pr } = context.payload;
-    if (action === 'opened') await draftLargePr(pr);
-
-    const data = await github.graphql(PR_LINKS_QUERY, { owner, repo, number: pr.number });
-    const linked = data.repository.pullRequest.closingIssuesReferences.nodes;
-    for (const issue of linked) {
-      if (action === 'closed') {
-        const refs = await github.graphql(ISSUE_OPEN_PRS_QUERY, { owner, repo, number: issue.number });
-        const others = refs.repository.issue.closedByPullRequestsReferences.nodes.filter((n) => n.number !== pr.number);
-        if (others.length === 0) await removeLabel(issue.number, 'has-pr');
-      } else if (issue.state === 'OPEN' && !labelNames(issue).includes('has-pr')) {
-        await addLabel(issue.number, 'has-pr');
-      }
-    }
-  }
-
+  // Each PR is moved to draft at most once; the marker comment records that it was asked.
   async function draftLargePr(pr) {
-    if (pr.draft || pr.user.type === 'Bot' || TRUSTED_ASSOCIATIONS.has(pr.author_association)) return;
+    if (pr.isDraft || pr.author?.__typename === 'Bot' || TRUSTED_ASSOCIATIONS.has(pr.authorAssociation)) return;
+    if (Date.parse(pr.createdAt) < LARGE_PR_SINCE || pr.additions + pr.deletions <= LARGE_PR_LINES) return;
+    const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr.number, per_page: 100 });
+    if (comments.some((c) => c.body?.includes(LARGE_PR_MARKER))) return;
     const lines = pr.additions + pr.deletions;
-    if (lines <= LARGE_PR_LINES) return;
-    core.info(`Moving PR #${pr.number} to draft (${lines} lines, ${pr.author_association})`);
-    await github.graphql(
-      'mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { pullRequest { isDraft } } }',
-      { id: pr.node_id },
-    );
-    await comment(pr.number, LARGE_PR_MESSAGE);
+    await scheduledWrite('draft large PR', `move PR #${pr.number} to draft (${lines} lines, ${pr.authorAssociation})`, async () => {
+      await github.graphql(
+        'mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { pullRequest { isDraft } } }',
+        { id: pr.id },
+      );
+      await comment(pr.number, LARGE_PR_MESSAGE);
+    });
   }
 
   async function onIssueComment() {
@@ -252,6 +225,8 @@ module.exports = async ({ github, context, core }) => {
       });
     }
 
+    for (const pr of openPrs) await draftLargePr(pr);
+
     const linked = new Map();
     for (const pr of openPrs) {
       for (const issue of pr.closingIssuesReferences.nodes) {
@@ -307,7 +282,6 @@ module.exports = async ({ github, context, core }) => {
       .write();
   }
 
-  if (context.eventName === 'pull_request_target') return onPullRequest();
   if (context.eventName === 'issue_comment') return onIssueComment();
   return daily();
 };
