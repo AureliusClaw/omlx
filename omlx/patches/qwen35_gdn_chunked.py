@@ -6,9 +6,9 @@ Default route: ``gated_delta_pipelined`` — the exact sequential recurrence
 with 8 lanes per value row, 16-row threadgroups and a software-pipelined,
 unrolled 12-token block (Qwen3.8 16/48 heads, T=8191: 3.0 ms vs 4.9 ms per
 layer call for ``gated_delta_blocked_seq`` on M5 Ultra). Layouts it does not
-cover (key dim != 128, value dim not a multiple of 16) run
-``gated_delta_blocked_seq``: threadgroup-staged k/q/v blocks, register-resident
-state, Dv/32 split, fp32-exact state (rel-err ~5e-8).
+cover run ``gated_delta_blocked_seq``: threadgroup-staged k/q/v blocks,
+register-resident state, Dv/32 split, fp32-exact state (rel-err ~5e-8). Both
+kernels assume 128-wide heads, so the route only engages for Dk = Dv = 128.
 
 Optional route (``OMLX_GDN_IMPL=chunked``): the FLA chunked WY-representation
 kernels — accuracy-validated but slower than the stock kernel E2E; kept for

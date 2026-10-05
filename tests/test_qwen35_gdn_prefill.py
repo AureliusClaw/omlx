@@ -322,7 +322,7 @@ def test_prefill_patch_preserves_cache_owned_kernel_dispatch(monkeypatch):
     monkeypatch.setattr(gated_delta, "gated_delta_update", gated_delta.gated_delta_update)
     monkeypatch.setattr(language, "gated_delta_update", language.gated_delta_update)
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
-    initial = mx.zeros((1, 1, 32, 32))
+    initial = mx.zeros((1, 1, 128, 128))
     final = mx.ones_like(initial)
     calls = []
 
@@ -334,7 +334,7 @@ def test_prefill_patch_preserves_cache_owned_kernel_dispatch(monkeypatch):
     assert patch.apply_qwen35_gdn_prefill_patch()
     cache = ArraysCache(2)
     cache[1] = initial
-    q = mx.zeros((1, 64, 1, 32))
+    q = mx.zeros((1, 64, 1, 128))
     a = mx.zeros((1, 64, 1))
     output, state = gated_delta.gated_delta_update(
         q, q, q, a, a, mx.zeros((1,)), mx.zeros((1,)), cache=cache
