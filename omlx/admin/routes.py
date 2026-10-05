@@ -1580,11 +1580,7 @@ _ms_downloader = None
 _oq_manager = None
 _hf_uploader = None
 
-# GlobalSettings.save() performs an fsync'd atomic file write. Running it
-# inline in async handlers blocked the event loop for the write duration;
-# these saves now go through asyncio.to_thread. The lock preserves the
-# serialization the event loop used to provide implicitly, so one save can
-# never snapshot the settings singleton mid-mutation by another handler.
+# One save at a time: _save_data writes through a pid-named temp file.
 _settings_save_lock = asyncio.Lock()
 
 
@@ -5969,7 +5965,7 @@ async def get_logs(
 
     log_dir = global_settings.logging.get_log_dir(global_settings.base_path)
 
-    # Get available log files (directory scan + stats, offloaded)
+    # Get available log files
     available_files = await asyncio.to_thread(_get_available_log_files, log_dir)
 
     # Determine which file to read
@@ -5984,9 +5980,7 @@ async def get_logs(
         # Default to current log file
         log_file = log_dir / "server.log"
 
-    # Read log content. Offloaded to a thread: the tail scans the whole
-    # file, and a large rotated log would otherwise block the event loop
-    # (stalling the keep-alive heartbeats of in-flight streams).
+    # Read log content
     if log_file.exists():
         content, total_lines = await asyncio.to_thread(_tail_file, log_file, lines)
     else:
