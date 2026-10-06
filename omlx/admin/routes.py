@@ -31,7 +31,14 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
@@ -287,6 +294,25 @@ class CacheProbeRequest(BaseModel):
     thinking_budget: int | None = None
 
 
+def _draft_path_is_unusable(value: str) -> bool:
+    """True when ``value`` names a local draft directory with no config.json.
+
+    Matches local references without resolving or downloading HF repo IDs, so
+    ``NewHorizonGroup/Qwen3-...-oQ4`` is never treated as a filesystem path.
+    """
+    path = Path(value).expanduser()
+    if not (path.is_absolute() or value.startswith(("./", "../")) or path.exists()):
+        return False
+    return not (path / "config.json").is_file()
+
+
+# Dormant DFlash draft paths already reported in this process. Every save
+# re-sends the full payload and profile create/update runs the same validator,
+# so without this the same broken value would log a warning on every write
+# (#4217).
+_WARNED_DORMANT_DFLASH_DRAFTS: set[str] = set()
+
+
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
@@ -427,20 +453,52 @@ class ModelSettingsRequest(BaseModel):
             raise ValueError(f"Unknown reasoning_parser: {value}")
         return value
 
-    @field_validator(
-        "specprefill_draft_model", "dflash_draft_model", "vlm_mtp_draft_model"
-    )
+    @field_validator("specprefill_draft_model", "vlm_mtp_draft_model")
     @classmethod
     def validate_draft_path(cls, value: str | None) -> str | None:
         if not value:
             return None
-        path = Path(value).expanduser()
-        # Match local references without resolving or downloading HF repo IDs.
-        if (
-            path.is_absolute() or value.startswith(("./", "../")) or path.exists()
-        ) and not (path / "config.json").is_file():
+        if _draft_path_is_unusable(value):
             raise ValueError(f"Draft model has no config.json: {value}")
         return value
+
+    @field_validator("dflash_draft_model")
+    @classmethod
+    def validate_dflash_draft_path(
+        cls, value: str | None, info: ValidationInfo
+    ) -> str | None:
+        """Only check the draft path while DFlash is actually turned on (#4217).
+
+        Every settings save re-sends the whole payload, so a draft model that
+        was deleted from disk used to 422 *every* write, including ones with
+        nothing to do with DFlash. Switching the DFlash profile to Balanced
+        deliberately parks the stale path in settings.json so it comes back
+        when Custom is picked again, so it is validated when it is live and
+        kept verbatim when it is not.
+
+        This validator only sees the request payload, so it cannot tell whether
+        DFlash is already on in the *stored* settings -- the route re-checks the
+        effective post-save state, which also covers single-field patches that
+        omit ``dflash_enabled``.
+        """
+        if not value:
+            return None
+        # dflash_enabled is declared above this field, so pydantic has already
+        # validated it (unsent -> None) by the time we run.
+        if not info.data.get("dflash_enabled"):
+            if (
+                _draft_path_is_unusable(value)
+                and value not in _WARNED_DORMANT_DFLASH_DRAFTS
+            ):
+                _WARNED_DORMANT_DFLASH_DRAFTS.add(value)
+                logger.warning(
+                    "DFlash draft model %r is missing or incomplete but DFlash "
+                    "is off; keeping the stored value for when it is "
+                    "re-enabled.",
+                    value,
+                )
+            return value
+        return cls.validate_draft_path(value)
 
 
 def _normalize_profile_settings(
@@ -3187,6 +3245,28 @@ async def update_model_settings(
         )
     if "dflash_verify_mode" in sent:
         current_settings.dflash_verify_mode = request.dflash_verify_mode
+    # The field validator only sees the payload, so it cannot know that DFlash
+    # is already enabled in the stored settings. When this save actually
+    # touches DFlash, re-check the effective post-save state here -- after both
+    # DFlash blocks have been applied and before anything is validated,
+    # persisted or pushed to the engine -- so a single-field patch (the macOS
+    # app sends ``dflash_draft_model`` alone) or a flag-only enable can never
+    # leave DFlash on with a draft path that cannot load (#4217). A save that
+    # touches neither DFlash field is unrelated and keeps working, which is
+    # what #4217 asks for: a rejected save persists nothing, and a rejected
+    # unrelated save would brick the model's settings.
+    dflash_touched = "dflash_enabled" in sent or "dflash_draft_model" in sent
+    draft_model_after = current_settings.dflash_draft_model
+    if (
+        dflash_touched
+        and current_settings.dflash_enabled
+        and draft_model_after
+        and _draft_path_is_unusable(draft_model_after)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Draft model has no config.json: {draft_model_after}",
+        )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
