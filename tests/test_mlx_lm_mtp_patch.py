@@ -4587,13 +4587,13 @@ def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
     """Copied drafts never change greedy output, whichever of them is wrong.
 
     The proposer is replaced by the true continuation with one token flipped
-    at a position that moves every cycle, so the widest (8-row) windows are
+    at a position that moves every cycle, so the widest (16-row) windows are
     verified with accepted lengths from none to all.
     """
     from omlx.patches.mlx_lm_mtp import context_copy
 
     widest = context_copy.MAX_COPY
-    flips = (0, 1, 3, widest - 1, widest)  # ``widest``: nothing flipped
+    flips = (0, 1, 7, widest - 1, widest)  # ``widest``: nothing flipped
     previous = mlx_lm_mtp.is_mtp_active()
     try:
         mlx_lm_mtp.set_mtp_active(True)
@@ -4617,7 +4617,7 @@ def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
                 copied[wrong] ^= 1
             return copied if len(copied) >= 2 else []
 
-        def observe(self, count):
+        def observe(self, count, drafted):
             accepted.append(count)
 
         monkeypatch.setattr(context_copy.ContextCopy, "propose", propose)
@@ -4627,6 +4627,24 @@ def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
         assert set(flips) <= set(accepted)
     finally:
         mlx_lm_mtp.set_mtp_active(previous)
+
+
+@pytest.mark.parametrize("wide_window", [False, True])
+def test_context_copy_width_follows_the_targets_verify_window(wide_window):
+    """A verbatim run after a whole accept copies 15 tokens only for a target
+    that verifies 16-row windows; other targets (GLM-5.3 rolls back at most
+    8 rows) keep 7-token copies."""
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    source = list(range(1000, 1200))
+    history = source + source[:100]  # the tail repeats the source verbatim
+    copier = context_copy.ContextCopy(wide_window=wide_window)
+    copier.extend(history, [])
+    assert copier.propose(64) == source[100:107]
+    copier.observe(7, 7)
+    copier.extend(history + source[100:107], [])
+    expected = 15 if wide_window else 7
+    assert copier.propose(64) == source[107 : 107 + expected]
 
 
 @pytest.mark.parametrize("size", [2, 4])

@@ -3971,7 +3971,7 @@ def _context_copy_drafts(
         # False marks a request that never copies (disabled, or a DSpark
         # host whose drafter owns the window).
         state.context_copy = (
-            _context_copy.ContextCopy()
+            _context_copy.ContextCopy(wide_window=_row_exact_verify(gen_batch.model))
             if _context_copy.ENABLED and _dspark_host(gen_batch.model) is None
             else False
         )
@@ -4224,7 +4224,7 @@ def _run_verify_cycle_chain(
         state.stats.copy_cycles += 1
         state.stats.copy_drafted += k
         state.stats.copy_accepted += m
-        state.context_copy.observe(m)
+        state.context_copy.observe(m, k)
     else:
         if len(state.stats.depth_drafted) < state.depth:
             pad = state.depth - len(state.stats.depth_drafted)
