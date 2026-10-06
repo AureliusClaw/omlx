@@ -1713,6 +1713,8 @@ class SchedulerConfig:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk. Inert while nothing is decoding.
     decode_fairness: bool = True
+    # Set by the engine when MoE expert offload wrapped the model.
+    moe_offload_active: bool = False
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
@@ -1996,9 +1998,11 @@ class Scheduler:
         # prefill step changes cache-ON from one forward into multiple forwards.
         self._qwen35_prefill_floor = self._detect_qwen35_prefill_floor()
         self._qwen4_wide_prefill_step = self._detect_qwen4_wide_prefill_step()
-        self._qwen4_wide_first_chunk = bool(
-            self._qwen4_wide_prefill_step
-        ) and not self._qwen4_ple_gathers_ahead()
+        # A narrow first chunk lets the next chunk's PLE gather overlap GPU
+        # work, but with offloaded experts it costs one more full expert stream.
+        self._qwen4_wide_first_chunk = bool(self._qwen4_wide_prefill_step) and (
+            self.config.moe_offload_active or not self._qwen4_ple_gathers_ahead()
+        )
 
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
@@ -2457,6 +2461,11 @@ class Scheduler:
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        # Set by the engine when MoE expert offload wrapped the model.
+        self.moe_offload_stats: Callable[[], dict] | None = None
+        self.moe_offload_release: Callable[[], int] | None = None
+        self.moe_offload_restore: Callable[[], None] | None = None
+        self._moe_offload_slots_released = False
 
         # Step counter for periodic cleanup
         self._step_counter = 0
@@ -3052,11 +3061,15 @@ class Scheduler:
             from .custom_kernels.nax import is_nax_available
             from .settings import get_system_memory
 
-            if (
+            if not (
                 fast.is_native_available()
                 and fast.has_symbol("qwen4_qsa_sparse_gqa_attention")
-                and is_nax_available()
-                and get_system_memory() >= 64 * 1024**3
+            ):
+                return 0
+            # Offloaded experts are streamed once per prefill forward, so a
+            # wider step reads them fewer times; the memory guard still clamps it.
+            if self.config.moe_offload_active or (
+                is_nax_available() and get_system_memory() >= 64 * 1024**3
             ):
                 return _QWEN4_WIDE_PREFILL_STEP
         except Exception:
@@ -5714,6 +5727,20 @@ class Scheduler:
                 "Fixed recurrent state measured: %.1fMB per sequence",
                 total / 1024**2,
             )
+
+    def release_moe_offload_slots(self, request_id: str) -> int:
+        """Release the offload slots for ``request_id``'s prefill; return the bytes.
+
+        Skipped while another request runs; the next decode step restores them."""
+        if self.moe_offload_release is None or any(
+            rid != request_id for rid in self.running
+        ):
+            return 0
+        released = self.moe_offload_release()
+        if released:
+            self._moe_offload_slots_released = True
+            self._reclaim_prefill_headroom()
+        return released
 
     def _reclaim_prefill_headroom(self) -> int:
         """Reclaim Metal headroom mid-prefill and return the re-measured usage.
@@ -9661,6 +9688,8 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
         self._resolve_generation_prompt_start(request)
+        if self.moe_offload_stats is not None:
+            request.moe_offload_start = self.moe_offload_stats()
 
         if self.block_aware_cache is not None:
             # Arm MTP boundary alignment now: a prompt shorter than a block meets
@@ -10078,6 +10107,26 @@ class Scheduler:
             self._vlm_mtp_draft_block_size,
         )
         return uid
+
+    def _log_moe_offload_stats(self, request: Request) -> None:
+        """Log the expert cache counters accrued while ``request`` ran.
+
+        The counters are per engine, so concurrent requests share them."""
+        start, now = request.moe_offload_start, self.moe_offload_stats()
+        hits = now["hits"] - start["hits"]
+        misses = now["misses"] - start["misses"]
+        total = hits + misses
+        logger.info(
+            "MoE offload: request=%s hit_rate=%s hits=%d misses=%d "
+            "fetched=%.1f MB prompt=%d output=%d",
+            request.request_id,
+            f"{100 * hits / total:.1f}%" if total else "n/a",
+            hits,
+            misses,
+            (now["fetched_bytes"] - start["fetched_bytes"]) / 1e6,
+            request.num_prompt_tokens,
+            request.num_output_tokens,
+        )
 
     def _log_vlm_mtp_stats(
         self, state: "_VLMMTPDecodeState", finish_reason: str
@@ -12496,6 +12545,8 @@ class Scheduler:
                     f"Request {request_id} finished: {response.finish_reason}, "
                     f"{request.num_output_tokens} tokens"
                 )
+                if request.moe_offload_start is not None:
+                    self._log_moe_offload_stats(request)
                 logger.log(
                     5, "Request %s generated text:\n%s", request_id, output.output_text
                 )
@@ -13523,6 +13574,9 @@ class Scheduler:
             if (
                 self.batch_generator is not None or self._vlm_mtp_active
             ) and self.running:
+                if self._moe_offload_slots_released:
+                    self._moe_offload_slots_released = False
+                    self.moe_offload_restore()
                 _t_decode_start = time.perf_counter()
                 if self.batch_generator is not None:
                     responses = list(self.batch_generator.next_generated())
