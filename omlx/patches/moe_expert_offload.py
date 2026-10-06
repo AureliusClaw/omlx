@@ -629,6 +629,42 @@ class ExpertCache:
 _SORT_MIN_ROUTES = 64
 
 
+def _pad_floor(capacity: int) -> int:
+    # GatherQMM uses sorted QMM only when B >= 16 and B / E >= 4
+    # (E = resident slots); below that, padding would change kernels.
+    return max(16, 4 * capacity)
+
+
+def _expert_route_chunks(
+    run_starts: np.ndarray, n_routes: int, capacity: int
+) -> list[tuple[int, int]]:
+    """Chunks of at most ``capacity`` experts, power-of-two sized if that pads less."""
+    cuts = run_starts[::capacity].tolist() + [n_routes]
+    whole = list(zip(cuts[:-1], cuts[1:]))
+    floor = _pad_floor(capacity)
+    if any(end - start < floor for start, end in whole):
+        return whole
+    packed = []
+    start = 0
+    while start < n_routes:
+        first = int(np.searchsorted(run_starts, start, side="right")) - 1
+        last = first + capacity
+        limit = int(run_starts[last]) if last < len(run_starts) else n_routes
+        size = 1 << ((limit - start).bit_length() - 1)
+        tail = n_routes - start - size
+        if 0 < tail < floor:
+            size = size // 2 if size // 2 >= floor else limit - start
+        if size < floor:
+            return whole
+        packed.append((start, start + size))
+        start += size
+
+    def padded_rows(chunks):
+        return sum(1 << (end - start - 1).bit_length() for start, end in chunks)
+
+    return packed if padded_rows(packed) < padded_rows(whole) else whole
+
+
 class OffloadSwitchGLU(nn.Module):
     """SwitchGLU whose experts live in an :class:`ExpertCache`."""
 
@@ -744,10 +780,10 @@ class OffloadSwitchGLU(nn.Module):
         """Over-capacity prefill: chunk the routes on expert boundaries.
 
         ``ids[t * k + j]`` is the expert of token ``t``'s ``j``-th route. The
-        routes are sorted by expert and cut into chunks holding every route
-        of up to ``capacity`` distinct experts, the same shape as the
-        DeepSeek V4.1 adapter's sorted prefill: an expert's routes all land
-        in one chunk, so each expert is installed at most once per call
+        routes are sorted by expert, resident experts first, and cut into
+        chunks of up to ``capacity`` distinct experts (see
+        :func:`_expert_route_chunks`), the same shape as the DeepSeek V4.1
+        adapter's sorted prefill: each expert is installed at most once per call
         (the token-chunked path re-fetched an expert in every chunk that
         touched it, evicting on the way). Routes within a chunk are
         independent — the cross-expert weighted sum happens in the caller —
@@ -761,13 +797,16 @@ class OffloadSwitchGLU(nn.Module):
         c = self.cache
         d_model = flat_x.shape[-1]
         ids_np = np.asarray(ids, dtype=np.int64)
-        order = np.argsort(ids_np, kind="stable")  # routes grouped by expert
+        resident = np.zeros(c.n_experts, dtype=np.bool_)
+        resident[c.slot_expert[c.slot_expert >= 0]] = True
+        # Resident experts first: a miss evicts only experts already used.
+        rank = ids_np + (~resident[ids_np]) * c.n_experts
+        order = np.argsort(rank, kind="stable")  # routes grouped by expert
         sorted_ids = ids_np[order]
         # every position where a new expert's run begins, chunked by capacity
         run_starts = np.flatnonzero(np.diff(sorted_ids)) + 1
         run_starts = np.concatenate(([0], run_starts))
-        cuts = run_starts[:: c.capacity].tolist() + [len(ids)]
-        chunks = list(zip(cuts[:-1], cuts[1:]))
+        chunks = _expert_route_chunks(run_starts, len(ids), c.capacity)
         outs = []
         ahead: dict = {}
         try:
@@ -777,9 +816,7 @@ class OffloadSwitchGLU(nn.Module):
                 ahead = {}
                 n_routes = end - start
                 padded_routes = n_routes
-                # GatherQMM uses sorted QMM only when B >= 16 and B / E >= 4
-                # (E = resident slots); below that, padding would change kernels.
-                if n_routes >= max(16, 4 * c.capacity):
+                if n_routes >= _pad_floor(c.capacity):
                     # Power-of-two sizes repeat across layers, so the Metal pool
                     # reuses those buffers instead of keeping one per size.
                     padded_routes = 1 << (n_routes - 1).bit_length()
