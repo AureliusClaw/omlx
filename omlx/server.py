@@ -182,6 +182,7 @@ from .api.utils import (
     prepare_system_messages_for_template,
     cache_reasoning_output,
     uses_native_reasoning_content,
+    uses_thinking_mode_kwarg,
 )
 from .engine import BaseEngine, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
@@ -4810,9 +4811,18 @@ def _compile_with_structural_tag(
     _install_torch_stub()
     import xgrammar as xgr
 
-    reasoning = not (
-        chat_template_kwargs and chat_template_kwargs.get("enable_thinking") is False
-    )
+    # The model-native ``thinking_mode`` wins over the portable boolean, which
+    # is the same precedence the MiniMax-M3 template translator applies.  Read
+    # it here too, or a request carrying ``thinking_mode: "disabled"`` renders a
+    # prompt with thinking off while the grammar still waits for a thinking
+    # phase that never starts (#4242).
+    if chat_template_kwargs and "thinking_mode" in chat_template_kwargs:
+        reasoning = chat_template_kwargs["thinking_mode"] != "disabled"
+    else:
+        reasoning = not (
+            chat_template_kwargs
+            and chat_template_kwargs.get("enable_thinking") is False
+        )
     tag = xgr.get_builtin_structural_tag(reasoning_parser, reasoning=reasoning)
     tag_dict = tag.model_dump()
     if not _patch_output_format(tag_dict, fmt):
@@ -6558,16 +6568,34 @@ async def create_anthropic_message(
         )
         forced_keys = forced_ct_keys(ms)
 
+        _entry = get_engine_pool().get_entry(resolved_model)
+
         # Pass Anthropic thinking config to chat template (except forced keys)
         if hasattr(request, "thinking") and request.thinking:
             if "enable_thinking" not in forced_keys:
                 thinking_type = getattr(request.thinking, "type", None)
                 if thinking_type in ("enabled", "adaptive"):
                     merged_ct_kwargs["enable_thinking"] = True
+                    # ``enable_thinking`` is two-state, so "adaptive" would be
+                    # indistinguishable from "enabled".  Templates whose
+                    # ``thinking_mode`` is three-state get the state itself;
+                    # every other template keeps the portable boolean (#4242).
+                    # A client-supplied or operator-pinned ``thinking_mode``
+                    # wins, so only fill the key when nobody set it.
+                    if (
+                        thinking_type == "adaptive"
+                        and "thinking_mode" not in forced_keys
+                        and uses_thinking_mode_kwarg(
+                            resolved_model,
+                            config_model_type=getattr(
+                                _entry, "config_model_type", None
+                            ),
+                            engine_model_type=getattr(engine, "model_type", None),
+                        )
+                    ):
+                        merged_ct_kwargs.setdefault("thinking_mode", "adaptive")
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
-
-        _entry = get_engine_pool().get_entry(resolved_model)
 
         logger.debug(
             f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
