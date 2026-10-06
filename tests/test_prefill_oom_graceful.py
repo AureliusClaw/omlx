@@ -1253,12 +1253,10 @@ def test_prefill_reserve_keeps_room_for_a_floor_chunk():
 
 
 @pytest.mark.parametrize(
-    ("monitor", "expected_gathered", "expected_state_route"),
-    [(_qwen4_monitor(), True, True), (_monitor(head_dim=192), False, None)],
+    ("monitor", "expected_gathered"),
+    [(_qwen4_monitor(), True), (_monitor(head_dim=192), False)],
 )
-def test_step_prefill_reclaims_before_first_guard(
-    monitor, expected_gathered, expected_state_route
-):
+def test_step_prefill_reclaims_before_first_guard(monitor, expected_gathered):
     events = []
     request = SimpleNamespace(request_id="req-prefill")
     state = _PrefillState(
@@ -1347,7 +1345,6 @@ def test_step_prefill_reclaims_before_first_guard(
         requested_step=2,
         gathered_core=expected_gathered,
     )
-    assert state.qwen4_gathered_core is expected_state_route
 
 
 # --------------------------------------------------------------------------

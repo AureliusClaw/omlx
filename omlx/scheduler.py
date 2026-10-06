@@ -524,7 +524,6 @@ class _PrefillState:
     sampler: Any = None
     sm: Any = None
     per_row_lps: Any = None
-    qwen4_gathered_core: bool | None = None
     # Tail snapshot plan, see _prefill_tail_plan.
     tail_at: int | None = None
     end_tail: bool = False
@@ -3782,16 +3781,15 @@ class Scheduler:
         before Metal sees it.
         """
         if prompt_cache is not None:
-            try:
-                from mlx_vlm.models.qwen4_exp.language import QSAKVCache
-            except ImportError:
-                return False
             qsa_caches = [
                 cache
                 for cache in prompt_cache
                 if callable(getattr(cache, "reserve_index_capacity", None))
             ]
-            if not qsa_caches or any(type(cache) is not QSAKVCache for cache in qsa_caches):
+            # Runtime gathers only on the exact float QSAKVCache type.
+            if not qsa_caches or any(
+                type(cache).__name__ != "QSAKVCache" for cache in qsa_caches
+            ):
                 return False
         monitor = getattr(self, "memory_monitor", None)
         checker = getattr(monitor, "qwen4_gathered_prefill_route", None)
@@ -3814,6 +3812,25 @@ class Scheduler:
             )
         ]
         return all(routes) if routes else predicted
+
+    def _guard_prefill_chunk_route(
+        self,
+        n_tokens: int,
+        route: Callable[[int], bool],
+        **guard_kwargs: Any,
+    ) -> tuple[int, bool]:
+        """Guard a chunk, then guard again if the final width changes its route."""
+        gathered_core = route(n_tokens)
+        n_tokens = self._guard_prefill_chunk(
+            n_tokens, gathered_core=gathered_core, **guard_kwargs
+        )
+        final_route = route(n_tokens)
+        if final_route != gathered_core:
+            gathered_core = final_route
+            n_tokens = self._guard_prefill_chunk(
+                n_tokens, gathered_core=gathered_core, **guard_kwargs
+            )
+        return n_tokens, gathered_core
 
     def _do_external_prefill(
         self,
@@ -4049,29 +4066,17 @@ class Scheduler:
                         kv_len=cache_tokens,
                         gathered_core=gathered_core,
                     )
-                gathered_core = _chunk_route(n_to_process, cache_tokens)
                 # Check the predicted peak before submitting work to Metal.
-                n_to_process = self._guard_prefill_chunk(
+                n_to_process, gathered_core = Scheduler._guard_prefill_chunk_route(
+                    self,
                     n_to_process,
+                    lambda n, kv=cache_tokens: _chunk_route(n, kv),
                     kv_len=cache_tokens,
                     progress=processed_tokens,
                     loop_label="external",
                     request_id=request.request_id,
-                    gathered_core=gathered_core,
                     **({"minimum_tokens": atomic_prefix} if atomic_prefix else {}),
                 )
-                final_route = _chunk_route(n_to_process, cache_tokens)
-                if final_route != gathered_core:
-                    gathered_core = final_route
-                    n_to_process = self._guard_prefill_chunk(
-                        n_to_process,
-                        kv_len=cache_tokens,
-                        progress=processed_tokens,
-                        loop_label="external",
-                        request_id=request.request_id,
-                        gathered_core=gathered_core,
-                        **({"minimum_tokens": atomic_prefix} if atomic_prefix else {}),
-                    )
             except _PrefillEvictionNeeded:
                 # Keep token progress aligned with the advanced KV on retry.
                 # Cold requests must also retain their locally created cache.
@@ -6203,29 +6208,18 @@ class Scheduler:
             kv_len=cache_tokens,
             gathered_core=gathered_core,
         )
-        gathered_core = qwen4_route(n)
 
         # Pre-chunk safety guard (mirrors the external loop): never submit a
         # chunk whose predicted peak would trip the uncatchable async Metal OOM.
-        n = self._guard_prefill_chunk(
+        n, gathered_core = Scheduler._guard_prefill_chunk_route(
+            self,
             n,
+            qwen4_route,
             kv_len=cache_tokens,
             progress=state.tokens_processed,
             loop_label="chunked_step",
             request_id=state.request.request_id,
-            gathered_core=gathered_core,
         )
-        final_route = qwen4_route(n)
-        if final_route != gathered_core:
-            gathered_core = final_route
-            n = self._guard_prefill_chunk(
-                n,
-                kv_len=cache_tokens,
-                progress=state.tokens_processed,
-                loop_label="chunked_step",
-                request_id=state.request.request_id,
-                gathered_core=gathered_core,
-            )
         # Count only tokens actually passed to the model.
         n = min(n, remaining)
         if getattr(state.request, "benchmark_trace", False):
@@ -6290,7 +6284,6 @@ class Scheduler:
                     n,
                     state.base_size + state.tokens_processed,
                 )
-            state.qwen4_gathered_core = actual_gathered_core
         self._record_chunk_transient(
             n,
             _throttle_pre,

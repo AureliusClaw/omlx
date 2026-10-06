@@ -23,9 +23,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from omlx.memory_monitor import (
-    qwen4_gathered_min_query_tokens as _gathered_min_query_tokens,
-)
 from omlx.memory_monitor import qwen4_gathered_prefill_route
 from omlx.memory_monitor import (
     qwen4_text_mrope_broadcast as _broadcast_text_mrope_position_ids,
