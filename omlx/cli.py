@@ -15,8 +15,10 @@ Usage:
 """
 
 import argparse
+import errno
 import faulthandler
 import math
+import socket
 import sys
 
 from ._version import __version__
@@ -158,39 +160,18 @@ def _migrate_saved_network_auth(settings, args) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _bind_secondary_socket(host: str, port: int):
-    """Bind one socket for a secondary bind address.
-
-    Mirrors the plain-TCP branch of ``uvicorn.Config.bind_socket`` -- which is
-    the only branch ``serve_command`` can reach, since it never configures
-    ``uds``, ``fd`` or ``ssl``: choose the family from the address, set
-    ``SO_REUSEADDR``, bind, and mark the descriptor inheritable. Uvicorn's
-    ``Server.run(sockets=[...])`` hands each socket straight to
-    ``loop.create_server(sock=...)``, which wants a bound (not yet listening)
-    socket, exactly what this returns.
-
-    The bind is done here rather than through ``Config.bind_socket`` because
-    that method swallows the ``OSError`` and exits with code 3, which loses the
-    errno. Callers need it to tell "this address is not on any local interface"
-    apart from a port clash or a permission problem.
-    """
-    import socket
-
+def _is_local_address(host: str) -> bool:
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    sock = socket.socket(family=family)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((host, port))
-    except BaseException:
-        sock.close()
-        raise
-    sock.set_inheritable(True)
-    return sock
+    with socket.socket(family) as probe:
+        try:
+            probe.bind((host, 0))
+        except OSError as exc:
+            return exc.errno != errno.EADDRNOTAVAIL
+    return True
 
 
 def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
-    import errno
     import logging
     import os
     import uvicorn
@@ -332,6 +313,11 @@ def serve_command(args):
     # normal startup runs ASGI lifespan before binding host/port, which means
     # pinned models can be preloaded before a port conflict is detected.
     bind_hosts = [h.strip() for h in settings.server.host.split(",") if h.strip()]
+    # A secondary address such as a VPN IP can be missing until its link is up.
+    for h in bind_hosts[1:]:
+        if not _is_local_address(h):
+            print(f"Warning: skipping {h}, it is not assigned to any local interface")
+            bind_hosts.remove(h)
     for h in bind_hosts:
         print(f"Binding server at http://{h}:{settings.server.port}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
@@ -350,43 +336,15 @@ def serve_command(args):
     # Bind a socket per host so an occupied port fails fast before model preload.
     # uvicorn.Server.run(sockets=[...]) accepts a list and listens on all of them.
     serve_sockets = [uvicorn_config.bind_socket()]
-    bound_hosts = [bind_hosts[0]]
     for h in bind_hosts[1:]:
-        try:
-            serve_sockets.append(_bind_secondary_socket(h, settings.server.port))
-        except OSError as exc:
-            # EADDRNOTAVAIL means this address is on no local interface right
-            # now -- a VPN/Tailscale link that is down, e.g. when the machine
-            # woke before the tunnel came back. The primary is already bound,
-            # so the alternative is refusing to serve on the address that does
-            # work. Everything else (EADDRINUSE, EACCES, a gaierror from a
-            # mistyped address -- itself an OSError subclass) is a real
-            # configuration fault and stays fatal.
-            if exc.errno != errno.EADDRNOTAVAIL:
-                # socket.bind does not name the address it failed on, and this
-                # path no longer goes through uvicorn's error logger, so say
-                # which address was at fault before letting the error through.
-                print(
-                    f"Configuration error: cannot bind {h}:{settings.server.port}: "
-                    f"{exc.strerror} [Errno {exc.errno}]",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                raise
-            # Warn rather than drop silently: a skipped bind that the user
-            # cannot see leaves them expecting oMLX on the VPN address and
-            # getting connection refused, which is the confusion that produced
-            # this bug. print(), not the logger, because file logging is a
-            # separate destination the user may never open.
-            print(
-                f"Warning: Skipping bind address {h}: {exc.strerror} "
-                f"[Errno {exc.errno}]. The server is still reachable on "
-                f"{', '.join(bound_hosts)}. Re-run omlx serve once "
-                f"{h} is assigned to an interface.",
-                flush=True,
-            )
-            continue
-        bound_hosts.append(h)
+        extra_cfg = uvicorn.Config(
+            "omlx.server:app",
+            host=h,
+            port=settings.server.port,
+            log_level=uvicorn_level,
+            access_log=show_access_log,
+        )
+        serve_sockets.append(extra_cfg.bind_socket())
 
     try:
         # Import server and config after the port is known to be available.
@@ -510,7 +468,7 @@ def serve_command(args):
             global_settings=settings,
         )
 
-        for h in bound_hosts:
+        for h in bind_hosts:
             print(f"Starting server at http://{h}:{settings.server.port}")
         try:
             uvicorn.Server(uvicorn_config).run(sockets=serve_sockets)

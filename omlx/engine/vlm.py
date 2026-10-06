@@ -215,24 +215,12 @@ def _apply_minimax_m3_thinking_mode(
         return
     enable_thinking = template_kwargs.pop("enable_thinking", None)
     if "thinking_mode" in template_kwargs:
-        if enable_thinking is not None:
-            logger.debug(
-                "MiniMax M3 request carries both enable_thinking=%r and "
-                "thinking_mode=%r; the model-native thinking_mode wins",
-                enable_thinking,
-                template_kwargs["thinking_mode"],
-            )
         return
 
     if enable_thinking is True:
         template_kwargs["thinking_mode"] = "enabled"
     elif enable_thinking is False:
         template_kwargs["thinking_mode"] = "disabled"
-    elif enable_thinking == "adaptive":
-        # The template has three states; the boolean key only carries two, so
-        # a string on it would otherwise be dropped and the request would fall
-        # back to the template default (#4242).
-        template_kwargs["thinking_mode"] = "adaptive"
 
 
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
@@ -3907,33 +3895,6 @@ class VLMBatchedEngine(BaseEngine):
             logger.debug("Failed to count VLM image tokens", exc_info=True)
             return None
 
-    def _image_token_string(self) -> Optional[str]:
-        """The literal token a processor scans the rendered prompt for.
-
-        Only the processor's own declaration counts. Deriving the string from
-        ``config.image_token_id`` instead would misfire on Gemma 3/4, whose
-        template emits ``<start_of_image>`` while the soft-token id is expanded
-        later, inside the processor.
-
-        Returns ``None`` when the token cannot be identified. Callers must read
-        ``None`` as "unknown" and stay silent -- only a positively identified
-        token can prove that a prompt is missing it.
-        """
-        declared = getattr(getattr(self, "_processor", None), "image_token", None)
-        return declared if isinstance(declared, str) and declared else None
-
-    def _missing_image_token_error(self, num_images: int) -> InvalidRequestError:
-        """The error for images that the rendered prompt cannot place."""
-        plural = "image" if num_images == 1 else "images"
-        return InvalidRequestError(
-            f"The chat template of {self._model_name} did not emit image tokens "
-            f"for the {num_images} provided {plural}, so the prompt cannot "
-            "reference them. This checkpoint appears to ship a text-only "
-            "chat template; replace it with a vision-capable one from the "
-            "upstream model repository.",
-            field="messages",
-        )
-
     def _cached_video_features(
         self, video_identity: str, input_ids: Any, extra_model_inputs: dict
     ) -> mx.array | None:
@@ -4223,28 +4184,32 @@ class VLMBatchedEngine(BaseEngine):
                 fast_cached_features = fast.pop("cached_image_features", None)
                 inputs = fast
         if inputs is None:
-            # A checkpoint whose chat template is text-only renders image parts
-            # as prose, so the processor finds no image token to expand and
-            # reports "More images were provided than image tokens." -- which
-            # reads like a client error for a request that carried one image.
-            # This has to run before the processor: the vendor exception is
-            # raised from inside it and never reaches the token-level check
-            # below.
-            if num_images > 0:
-                image_token = self._image_token_string()
-                rendered = prompt if isinstance(prompt, list) else [prompt]
-                texts = [item for item in rendered if isinstance(item, str)]
-                if image_token and texts and not any(
-                    image_token in item for item in texts
-                ):
-                    raise self._missing_image_token_error(num_images)
+            prompts = [prompt] if isinstance(prompt, str) else prompt
+            # A text-only chat template renders images as prose, and the
+            # processor then fails with a misleading image-count error.
+            image_token = getattr(self._processor, "image_token", None)
+            texts = [item for item in prompts if isinstance(item, str)]
+            if (
+                num_images
+                and isinstance(image_token, str)
+                and image_token
+                and texts
+                and not any(image_token in text for text in texts)
+            ):
+                raise InvalidRequestError(
+                    "The chat template did not emit image tokens for the "
+                    "attached images. This checkpoint likely ships a text-only "
+                    "chat template; use the vision template from the upstream "
+                    "model repository.",
+                    field="messages",
+                )
             # Tokenize text and preprocess images and audio
             inputs = prepare_inputs(
                 self._processor,
                 images=images if images else None,
                 audio=audio if audio else None,
                 videos=videos if videos else None,
-                prompts=[prompt] if isinstance(prompt, str) else prompt,
+                prompts=prompts,
             )
 
         input_ids = inputs["input_ids"]
@@ -4391,11 +4356,6 @@ class VLMBatchedEngine(BaseEngine):
             if num_images > 0:
                 image_hash = compute_image_hash(images)
                 image_token_count = self._image_token_count(input_ids)
-                # Processors that never validate leave this at zero: the model
-                # would receive vision features with no placeholder to merge
-                # them into. ``None`` means the token id is unknown, not empty.
-                if image_token_count == 0:
-                    raise self._missing_image_token_error(num_images)
             elif has_video:
                 image_cache_key_ranges = self._video_cache_key_ranges(
                     token_ids,
