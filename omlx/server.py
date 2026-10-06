@@ -7612,8 +7612,8 @@ async def stream_responses_api(
         output=[],
         tools=request.tools or [],
         tool_choice=request.tool_choice or "auto",
-        temperature=request.temperature,
-        top_p=request.top_p,
+        temperature=kwargs.get("temperature"),
+        top_p=kwargs.get("top_p"),
         max_output_tokens=request.max_output_tokens,
         previous_response_id=request.previous_response_id,
     )
@@ -8306,8 +8306,8 @@ async def stream_responses_api(
             if request.tools
             else []
         ),
-        "temperature": request.temperature,
-        "top_p": request.top_p,
+        "temperature": kwargs.get("temperature"),
+        "top_p": kwargs.get("top_p"),
         "max_output_tokens": request.max_output_tokens,
     }
     if truncated:
