@@ -30,12 +30,7 @@ _LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
 
 
 def find_lone_surrogate(value: Any, path: str = "") -> str | None:
-    """Return the path of the first string holding an unpaired UTF-16 surrogate.
-
-    JSON allows escapes such as ``"\\ud83d"`` with no partner (often from text
-    truncated through an emoji). Python decodes them into ``str`` values the
-    tokenizer cannot encode, so they must be rejected as a client error.
-    """
+    """Return the path of the first string with an unpaired UTF-16 surrogate."""
     if isinstance(value, str):
         return (path or "body") if _LONE_SURROGATE_RE.search(value) else None
     if isinstance(value, dict):

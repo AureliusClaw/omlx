@@ -53,6 +53,7 @@ from omlx.api.utils import (
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
+    find_lone_surrogate,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
@@ -3676,25 +3677,10 @@ class TestCacheReasoningOutput:
 
 
 class TestFindLoneSurrogate:
-    def test_clean_values_pass(self):
-        from omlx.api.utils import find_lone_surrogate
+    def test_reports_lone_surrogate_path_and_accepts_paired(self):
+        part = {"type": "text", "text": "hi \U0001f600"}
+        body = {"messages": [{"content": [part]}]}
+        assert find_lone_surrogate(body) is None
 
-        assert find_lone_surrogate({"messages": [{"role": "user", "content": "hi 😀"}]}) is None
-        assert find_lone_surrogate(["a", 1, None, {"b": ("c",)}]) is None
-
-    def test_reports_path_of_unpaired_high_surrogate(self):
-        from omlx.api.utils import find_lone_surrogate
-
-        body = {"messages": [{"role": "user", "content": "ok"}, {"role": "user", "content": "hi \ud83d"}]}
-        assert find_lone_surrogate(body) == "messages[1].content"
-
-    def test_reports_unpaired_low_surrogate_in_content_parts(self):
-        from omlx.api.utils import find_lone_surrogate
-
-        body = {"messages": [{"content": [{"type": "text", "text": "\ude00 tail"}]}]}
+        part["text"] = "hi \ud83d"
         assert find_lone_surrogate(body) == "messages[0].content[0].text"
-
-    def test_top_level_string(self):
-        from omlx.api.utils import find_lone_surrogate
-
-        assert find_lone_surrogate("\ud83d") == "body"

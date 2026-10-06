@@ -1530,7 +1530,7 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
 
 
 def _reject_lone_surrogates(request: BaseModel) -> None:
-    """Answer 400, not 500, for text the tokenizer cannot encode."""
+    # JSON allows lone surrogate escapes, but the tokenizer cannot encode them.
     field = find_lone_surrogate(request.model_dump(exclude_none=True))
     if field:
         raise InvalidRequestError(

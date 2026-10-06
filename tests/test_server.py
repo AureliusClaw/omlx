@@ -2,6 +2,7 @@
 """Tests for omlx.server module - sampling parameter resolution and exception handlers."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -529,6 +530,40 @@ class TestExceptionHandlers:
         assert response.status_code == 404
         data = response.json()
         assert "detail" in data
+
+    @pytest.mark.parametrize(
+        ("path", "body", "param"),
+        [
+            (
+                "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "hi \ud83d"}]},
+                "messages[0].content",
+            ),
+            ("/v1/completions", {"prompt": "hi \ud83d"}, "prompt"),
+            (
+                "/v1/messages",
+                {
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hi \ud83d"}],
+                },
+                "messages[0].content",
+            ),
+            (
+                "/v1/messages/count_tokens",
+                {"messages": [{"role": "user", "content": "hi \ud83d"}]},
+                "messages[0].content",
+            ),
+            ("/v1/responses", {"input": "hi \ud83d"}, "input"),
+        ],
+    )
+    def test_lone_surrogate_returns_400(self, client, path, body, param):
+        response = client.post(
+            path,
+            content=json.dumps({"model": "m", **body}),
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["param"] == param
 
     def test_non_api_validation_error_with_value_error_ctx_returns_422(self):
         """A ValueError-raising validator on a non-/v1/ route must 422, not 500.
