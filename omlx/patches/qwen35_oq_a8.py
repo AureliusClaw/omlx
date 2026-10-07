@@ -17,6 +17,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from .m5_gather_qmm_a8 import tag_routed_a8_modules
 from .qwen35_packed_linear import PackedLinear
 
 logger = logging.getLogger(__name__)
@@ -612,10 +613,7 @@ def apply_qwen35_oq_a8_patch(
 
     tagged = _tag_modules(model, config) if model is not None else 0
     if model is not None:
-        # The routed-expert Gate+Up (QuantizedSwitchLinear, not covered by the
-        # dense plans above) follows the same per-model opt-in.
-        from .m5_gather_qmm_a8 import tag_routed_a8_modules
-
+        # The routed-expert Gate+Up follows the same per-model opt-in.
         tag_routed_a8_modules(model, floor)
 
     if not _MLP_PATCHED:

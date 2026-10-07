@@ -38,33 +38,14 @@ Contract (identical to the dense oQ A8 kernels; see
     GEMM         acc_g = sum over the group of Qa * Qw, exact in INT32.
     correction   out = Sa[m] * sum_g (Sw_g * acc_g + Bw_g * Ra_g)
 
-Stage A runs once per *token row*, and the kernel reads the token rows through
-``row_map``. The activation is never quantized per route, so the top-k
-replication does not multiply its cost.
+Stage A runs once per token row and the kernel reads those rows through
+``row_map``, so top-k replication does not repeat the quantization.
 
-Scale / bias metadata: no copy
-------------------------------
-The kernel reads the checkpoint's own ``[E, N, G]`` scale and bias tensors. It
-does not need the transposed ``[E, G, N]`` layout that a per-group vector load
-would prefer, and so no persistent transposed copy exists (such a copy would
-cost 100 MiB per layer, 4.7 GiB for Qwen3.8-Flash-Next). Instead, each
-threadgroup stages the metadata of the 64 weight rows of its own tile once, as
-``[group][row]``, in threadgroup memory, and reads the K loop's per-group
-values from there. In the checkpoint layout the ``G`` values of one row are
-contiguous, so the staging loads are 8-byte vector loads of four consecutive
-groups.
-
-Threadgroup memory of the staging buffers (scale + bias, BF16 or FP16):
-
-    2 tensors x 64 weight rows x G groups x 2 bytes
-        Qwen3.8-Flash-Next: K = 2560, G = 40  ->  10 KiB per tile
-        upper bound: G = 64 (K = 4096)        ->  16 KiB per tile
-
-The bound covers every Qwen MoE hidden size in use and stays at half of the
-32 KiB threadgroup memory of an Apple GPU. A model whose ``G`` is above 64, or
-not a multiple of 4 (the staging loads four groups at a time), takes scalar
-loads of the same checkpoint layout instead; both loaders produce identical
-bits.
+The kernel reads the checkpoint's ``[E, N, G]`` scale/bias in place. Each
+threadgroup stages the metadata of its 64 weight rows as ``[group][row]`` in
+threadgroup memory (2 x 64 x G x 2 bytes: 10 KiB for Flash-Next, 16 KiB at
+G = 64). A larger ``G``, or one that is not a multiple of 4, uses scalar loads
+of the same layout with identical bits.
 """
 
 from __future__ import annotations
@@ -76,6 +57,9 @@ import threading
 import mlx.core as mx
 
 from . import m5_gather_qmm_nax as _nax
+from .m5_gather_qmm import _swiglu_limit
+from .mlx_lm_mtp.batch_generator import _mtp_language_model, _mtp_module
+from .moe_expert_offload import OffloadSwitchGLU
 
 logger = logging.getLogger(__name__)
 
@@ -88,14 +72,8 @@ _GROUP = 64
 # 2 x 64 rows x 64 groups x 2 bytes = 16 KiB (see the module docstring).
 _STAGE_MAX_GROUPS = 64
 
-# Tile height. The A16 planner (``m5_gather_qmm_nax._plan``) is not reused: it
-# picks 64-128 rows per tile, which is not the A8 optimum. Measured on M5 Max
-# with real Qwen3.8-Flash-Next routing (E=512, K=2560, fused N=1280, Q4/GS64),
-# BM32 was the fastest or tied-fastest tile at every route set from 10K to 328K
-# rows, and BM64-128 lose up to 1.5x at 10K rows. Kernel time tracks the
-# *scheduled* rows of the tile list more closely than the useful rows: the
-# masked rows of a partial tile still cost tensor-op and weight-slice time, and
-# BM32 schedules the fewest.
+# Tile height. On M5 Max with Flash-Next routes (10K-328K rows) BM32 was the
+# fastest or tied; the A16 planner's 64-128 rows lose up to 1.5x.
 _BM = 32
 
 _lock = threading.RLock()
@@ -649,7 +627,6 @@ def sorted_gather_qmm_a8(
     group_size,
     bits,
     mode="affine",
-    bm=None,
     swiglu=False,
     init_value=None,
 ):
@@ -666,22 +643,19 @@ def sorted_gather_qmm_a8(
     ``silu(gate) * up`` as ``[M, 1, n]`` (see the kernel header for the exact
     rounding contract).
 
-    ``bm`` pins the tile height and ``init_value`` pre-fills the output
-    (both for tests: the latter detects unwritten elements).
+    ``init_value`` pre-fills the output, so tests can detect unwritten
+    elements.
     """
     if not enabled() or not supports(
         x, w, scales, biases, indices, group_size, bits, mode, row_map
     ):
-        return None
-    bm = _BM if bm is None else bm
-    if bm % 32 or bm < 32 or bm > 256:
         return None
     # One canary verdict per kernel instantiation (dtype and K).
     if not _nax._checked(("a8", x.dtype, int(x.shape[2]) // _GROUP), _self_test):
         return None
     return _launch(
         x, w, scales, biases, indices, row_map,
-        bm=bm, swiglu=swiglu, init_value=init_value,
+        bm=_BM, swiglu=swiglu, init_value=init_value,
     )
 
 
@@ -752,32 +726,23 @@ def _self_test(key: tuple):
 
 # -- routed MoE integration --------------------------------------------------
 #
-# The routed A8 Gate+Up is an opt-in of the *model*, made through the same
-# per-model setting as the dense oQ A8 kernels (``qwen35_oq_a8_enabled``):
-# ``apply_qwen35_oq_a8_patch`` calls ``tag_routed_a8_modules``, which marks the
-# backbone ``SwitchGLU`` modules of that one loaded model. A module without the
-# mark -- every module of a model loaded with the setting off, the MTP draft
-# layer, or anything attached later -- keeps the A16 path.
+# ``apply_qwen35_oq_a8_patch`` (the ``qwen35_oq_a8_enabled`` setting) tags the
+# backbone SwitchGLU modules of one loaded model. Untagged modules, including
+# the MTP draft layer, keep the A16 path.
 
 _TAG = "_omlx_routed_a8_min_tokens"
 
-# Model families whose routed Gate+Up has been measured (speed and NLL) on this
-# path; the check mirrors ``qwen35_moe_gate_up._is_supported_family`` (module
-# path of the model class). Other Qwen MoE families that can enable
-# ``qwen35_oq_a8_enabled`` keep the A16 routed path until they are measured.
+# Model families measured for speed and NLL on this path (matched on the
+# model class module path, as ``qwen35_moe_gate_up`` does).
 _MEASURED_FAMILIES = ("qwen4_exp",)
 
-# Prefill-sized calls only. Decode and verify windows (at most a few dozen
-# rows) must stay A16, and sequences shorter than this are not measured, so the
-# model's ``qwen35_oq_a8_min_tokens`` can raise but not lower this floor.
+# Decode and verify windows stay A16. ``qwen35_oq_a8_min_tokens`` can raise
+# this floor but not lower it.
 _MIN_TOKENS_FLOOR = 128
 
 
 def _mtp_module_ids(model) -> set[int]:
-    """Ids of every module inside the model's MTP draft head, found the way the
-    MTP integration finds it (the language model's ``mtp`` / ``get_mtp_module``)."""
-    from .mlx_lm_mtp.batch_generator import _mtp_language_model, _mtp_module
-
+    """Ids of every module inside the model's MTP draft head."""
     mtp = _mtp_module(_mtp_language_model(model))
     if mtp is None or not hasattr(mtp, "modules"):
         return set()
@@ -829,13 +794,7 @@ def tag_routed_a8_modules(model, min_tokens: int) -> int:
 def _eligible(switch_mlp, activation) -> bool:
     """Plain affine Q4 / GS64 fused Gate+Up with an unclamped SwiGLU, on a
     module that is not an expert-offload wrapper."""
-    from .m5_gather_qmm import _swiglu_limit
-
-    if not _is_fused_routed_glu(switch_mlp):
-        return False
-    from .moe_expert_offload import OffloadSwitchGLU
-
-    if isinstance(switch_mlp, OffloadSwitchGLU):
+    if not _is_fused_routed_glu(switch_mlp) or isinstance(switch_mlp, OffloadSwitchGLU):
         return False
     gate_up, down = switch_mlp.get("gate_up_proj"), switch_mlp.get("down_proj")
     if "bias" in gate_up or "bias" in down:
@@ -853,23 +812,12 @@ _warned: set[str] = set()
 
 
 def try_routed_a8(switch_mlp, token_rows, idx, seq_len=None):
-    """Entry point of the sorted prefill call sites: the routed rows after the
-    A8 Gate+Up and the A16 Down (``[M, 1, K]``, still sorted), or None to keep
-    the A16 path.
+    """Sorted rows after the A8 Gate+Up and the A16 Down (``[M, 1, K]``), or
+    None to keep the A16 path.
 
-    ``token_rows`` is ``(x_tok, row_map)`` and ``idx`` the sorted expert
-    indices, exactly as ``moe_routes.sort_routes`` returns them. ``seq_len`` is
-    the sequence length of the call (``x.shape[-2]``): the flattened token
-    count is ``batch * seq_len``, so a batched *decode* step of 128 sequences
-    has 128 tokens but a sequence length of 1 and must keep the A16 path.
-    Without it the token count is used.
-
-    Two call sites reach it: ``qwen35_moe_gate_up`` (``SwitchGLU.__call__``,
-    below ``OMLX_QWEN35_MOE_WEIGHTED_SUM_MIN_TOKENS`` = 1024 tokens) and
-    ``qwen35_moe_weighted_sum`` (every larger prefill chunk).
-
-    Never raises: an exception turns the call into the A16 path, with one
-    warning per exception type.
+    ``token_rows`` and ``idx`` come from ``moe_routes.sort_routes``.
+    ``seq_len`` keeps a batched decode step (many sequences of one token) on
+    A16. Exceptions fall back to A16 with one warning per exception type.
     """
     min_tokens = getattr(switch_mlp, _TAG, None)
     if min_tokens is None:

@@ -1445,12 +1445,12 @@ def test_fused_verify_cycles_under_armed_verify_qmm_routing_are_bitwise_referenc
 @pytest.mark.usefixtures("glm5_fused_decode")
 def test_fused_verify_cycles_are_bitwise_reference_with_nax_tf32():
     """The production default runs fp32 GEMMs on NAX (TF32), where the
-    one-token HC expand and the verify router kernels also engage."""
+    one-token HC expand also engages."""
     here = Path(__file__).resolve().parent
     code = (
         "import sys; sys.path[:0] = [%r, %r]\n"
         "import test_glm5_next_mtp as t\n"
-        "t.dk.moe_router = t._kernel_parity_router(t.dk.moe_router)\n"
+        "t.dk.moe_router = t._stock_verify_router(t.dk.moe_router)\n"
         "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
         "used = []\n"
         "for seed, ctx in ((5, 300), (11, 2101)):\n"
@@ -1474,9 +1474,8 @@ def test_fused_verify_cycles_are_bitwise_reference_with_nax_tf32():
     for families in eval(used):
         assert {"kda", "hc_mix"} <= set(families), families
         if nax_tf32 == "True":
-            # The compiled verify FFN traces the fused router (its first-use
-            # check ran eagerly), and one-token blocks the fused HC expand.
-            assert {"router_rows", "hc_expand"} <= set(families), families
+            # One-token blocks run the fused HC expand.
+            assert "hc_expand" in families, families
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
@@ -1698,21 +1697,19 @@ def test_batched_rollback_rejects_a_fused_capture():
         rollback_rows(language, [cache], [capture], [0, 1], 4)
 
 
-def _kernel_parity_router(one_row):
-    """Pin block-reference routes when comparing downstream fusion kernels.
+def _stock_verify_router(fused):
+    """Leave verify rows to the stock router.
 
-    The default router is covered by test_glm53_verify_router.py. These
-    tests compare the remaining kernels with identical expert decisions.
+    Fused-vs-reference checks then compare the other kernels on the same
+    expert choices. The verify router has its own tests.
     """
 
-    def routed(x, *args, **kwargs):
-        if 2 <= x.shape[0] <= 8:
-            return dk.moe_router_rows(x, *args, **kwargs)
-        return one_row(x, *args, **kwargs)
+    def router(x, *args, **kwargs):
+        return None if x.shape[0] > 1 else fused(x, *args, **kwargs)
 
-    return routed
+    return router
 
 
 @pytest.fixture(autouse=True)
-def _verify_router_block_replay(monkeypatch):
-    monkeypatch.setattr(dk, "moe_router", _kernel_parity_router(dk.moe_router))
+def _pin_verify_router(monkeypatch):
+    monkeypatch.setattr(dk, "moe_router", _stock_verify_router(dk.moe_router))
