@@ -191,7 +191,7 @@ from .api.utils import (
     cache_reasoning_output,
     uses_native_reasoning_content,
 )
-from .engine import BaseEngine, VLMBatchedEngine
+from .engine import BaseEngine, GenerationOutput, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
 from .engine.vlm import MINIMAX_M3_MODEL_TYPES
 from .engine.embedding import EmbeddingEngine
@@ -4718,6 +4718,7 @@ async def create_chat_completion(
                 recovered = _nonstream_recovery_text(
                     extraction,
                     regular_content,
+                    output,
                     engine.tokenizer,
                     tools_for_template,
                 )
@@ -5582,6 +5583,7 @@ def _take_recoverable_withheld_text(
 def _nonstream_recovery_text(
     extraction: ToolCallExtraction,
     raw_text: str,
+    output: GenerationOutput,
     tokenizer: object,
     tools: object,
 ) -> str | None:
@@ -5591,8 +5593,13 @@ def _nonstream_recovery_text(
     failed = extraction.parse_errors
     if not failed or any(error != "incomplete" for error in failed):
         return None
+    # Judge the text the stream filter would see, before special tokens are
+    # cleaned out of it.
+    _, generated = extract_thinking(
+        output.text or "", truncated=output.finish_reason == "length"
+    )
     probe = ToolCallStreamFilter(tokenizer, tools=tools)
-    probe.feed(raw_text)
+    probe.feed(generated)
     probe.finish()
     if probe.recovery_candidate_is_payload() or not probe.take_recovery_candidate():
         return None
@@ -7184,6 +7191,7 @@ async def create_anthropic_message(
                 recovered = _nonstream_recovery_text(
                     extraction,
                     regular_content,
+                    output,
                     engine.tokenizer,
                     internal_tools,
                 )
@@ -7942,6 +7950,7 @@ async def create_response(
                 recovered = _nonstream_recovery_text(
                     extraction,
                     regular_content,
+                    output,
                     engine.tokenizer,
                     tools_for_template,
                 )

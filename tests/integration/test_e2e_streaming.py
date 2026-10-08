@@ -5118,6 +5118,7 @@ def test_nonstream_quoted_marker_is_delivered(monkeypatch, path, raw):
         "The tag <tool_call> is it. Now calling: " + _RECOVERY_TRUNCATED_JSON,
         _RECOVERY_MALFORMED_CLOSED + " The tag <tool_call> is it. END",
         'Saving now. <tool_call>write(content="hel',
+        "<tool_call>\n<|im_start|>function: run>\n<parameter=code>cut",
     ],
 )
 def test_nonstream_truncated_or_malformed_call_still_fails(monkeypatch, raw):
