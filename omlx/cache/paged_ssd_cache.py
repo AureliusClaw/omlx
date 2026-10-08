@@ -1918,7 +1918,10 @@ class PagedSSDCacheManager(CacheManager):
         Entries from save_block() use 'tensors_raw' (raw bytes).
         Entries from _promote_to_hot_cache() may use 'arrays' (mx.array objects
         loaded from SSD, not from active inference — safe to retain).
+        Staging buffers for queued SSD writes are not hot cache and count as 0.
         """
+        if entry.get("staging"):
+            return 0
         if "arrays" in entry:
             return sum(arr.nbytes for arr in entry["arrays"].values())
         if "tensors_raw" in entry:
@@ -3726,10 +3729,6 @@ class PagedSSDCacheManager(CacheManager):
             cache_entry["staging"] = True
             with self._hot_cache_lock:
                 self._hot_cache[block_hash] = cache_entry
-                # Match the subtraction in _hot_cache_remove().
-                self._hot_cache_total_bytes += self._hot_cache_entry_size(
-                    cache_entry
-                )
 
             # Track pending write
             with self._pending_write_hashes_lock:
