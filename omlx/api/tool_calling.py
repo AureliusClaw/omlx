@@ -2622,16 +2622,20 @@ class ToolCallStreamFilter:
     def recovery_candidate_is_payload(self) -> bool:
         """Whether the withheld tail holds a truncated call, not quoted prose.
 
-        Every opener in the tail is checked, so a real call after a quoted
-        marker still counts. Read it before ``take_recovery_candidate``.
+        Unsure cases count as calls, so they keep failing instead of leaking
+        call markup. Read it before ``take_recovery_candidate``.
         """
         tail = self._recovery_candidate
         if not tail:
             return False
         if self._opens_payload_at(tail, 0):
             return True
-        # One forward cursor per marker keeps marker-heavy tails linear.
         start = len(self._opener_at(tail, 0))
+        # A declared tool name is call evidence in any call format.
+        for name in self._registered_tool_names:
+            if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", tail[start:]):
+                return True
+        # One forward cursor per marker keeps marker-heavy tails linear.
         cursors = {
             marker: tail.find(marker, start)
             for marker, _close in self._marker_pairs

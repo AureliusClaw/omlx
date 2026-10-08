@@ -4970,6 +4970,7 @@ async def test_withheld_prose_after_literal_marker_is_delivered(api, chunk_size)
             "The tag ",
         ),
         (_RECOVERY_MALFORMED_CLOSED + " The tag <tool_call> is it. END", " The tag "),
+        ('Saving now. <tool_call>write(content="hel', "Saving now. "),
     ],
 )
 async def test_withheld_tool_payload_is_not_recovered(api, raw, visible):
@@ -5116,6 +5117,7 @@ def test_nonstream_quoted_marker_is_delivered(monkeypatch, path, raw):
         _RECOVERY_TRUNCATED_JSON,
         "The tag <tool_call> is it. Now calling: " + _RECOVERY_TRUNCATED_JSON,
         _RECOVERY_MALFORMED_CLOSED + " The tag <tool_call> is it. END",
+        'Saving now. <tool_call>write(content="hel',
     ],
 )
 def test_nonstream_truncated_or_malformed_call_still_fails(monkeypatch, raw):
