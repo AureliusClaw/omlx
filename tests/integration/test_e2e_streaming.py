@@ -4990,6 +4990,21 @@ async def test_withheld_prose_after_delivered_call_is_not_recovered():
     assert len(_recovery_calls(events, "chat")) == 1
 
 
+@pytest.mark.asyncio
+async def test_recovered_prose_reaches_responses_final_text():
+    events = await _recovery_stream(_RECOVERY_PROSE, "responses")
+
+    done = [e["text"] for e in events if e.get("type") == "response.output_text.done"]
+    completed = [
+        item["content"][0]["text"]
+        for e in events
+        if e.get("type") == "response.completed"
+        for item in e["response"].get("output", [])
+        if item.get("type") == "message"
+    ]
+    assert done == completed == [_RECOVERY_PROSE]
+
+
 def _nonstream_tool_call_client(monkeypatch, body: str):
     """Return a client whose model generates ``body`` for non-stream requests."""
     from types import SimpleNamespace

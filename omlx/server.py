@@ -8526,9 +8526,10 @@ async def stream_responses_api(
     if recovered_thinking or recovered_content:
         # The marker was quoted in prose, so this is not a failed tool call.
         tool_failure = None
-    if recovered_content and recovered_content not in cleaned_text:
-        # The final text must carry the tail streamed above.
-        cleaned_text += recovered_content
+    if recovered_content:
+        # The parser strips the prose before the marker, so rebuild the final
+        # text from the raw answer to match the streamed deltas.
+        cleaned_text = clean_special_tokens(regular_content)
     if not tool_calls and not tool_failure:
         for ev in _emit_reasoning_delta(recovered_thinking):
             yield ev
