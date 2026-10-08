@@ -42,7 +42,6 @@ SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
 _PATCHED = False
 
-
 def _native_ratio128_attention_enabled(config: dict[str, Any]) -> bool:
     """Keep the native ratio-128 attention path off for sub-4-bit V4."""
     if not str(config.get("model_type", "")).startswith("deepseek_v4"):
