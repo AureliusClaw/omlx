@@ -11,11 +11,19 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-mx.set_default_device(mx.cpu)
-
 from types import SimpleNamespace  # noqa: E402
 
 import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cpu_device():
+    # CPU only, but restore the previous default device: a module-level
+    # set_default_device would move every later test in the session.
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    yield
+    mx.set_default_device(previous)
 
 from omlx.request import SamplingParams  # noqa: E402
 from omlx.utils import sampling  # noqa: E402
