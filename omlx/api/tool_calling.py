@@ -2594,6 +2594,7 @@ class ToolCallStreamFilter:
         self._pending_envelope_parts: List[str] = []
         self._pending_start_marker: Optional[str] = None
         self._recovery_candidate = ""
+        self._recovery_is_payload = False
         self._completed_envelopes: List[str] = []
         self._completed_envelope_bytes = 0
         self._completed_envelope_overflowed = False
@@ -2624,6 +2625,68 @@ class ToolCallStreamFilter:
         candidate = self._recovery_candidate
         self._recovery_candidate = ""
         return candidate
+
+    def take_recovery_is_payload(self) -> bool:
+        """Whether the withheld tail opens a structured tool payload.
+
+        True means the tail is a truncated tool call, not prose: a caller must
+        keep treating it as a failed call rather than surfacing markup as
+        answer text.  Drained independently of ``take_recovery_candidate``
+        (each read clears only its own state); both default to False.
+        """
+
+        flag = self._recovery_is_payload
+        self._recovery_is_payload = False
+        return flag
+
+    def recovery_tail_has_later_opener(self) -> bool:
+        """Whether a later opener inside the withheld tail opens a payload.
+
+        Envelopes do not nest: everything from the first opening marker to EOF is
+        withheld as one tail, so a further opener inside it is model text the
+        filter never saw as an envelope.  A caller that judges the tail by the
+        text right after its first marker would call the whole tail prose even
+        when a genuine (truncated) call follows the quoted marker, so this guard
+        lets it refuse the tail instead (#4300 review).
+
+        Only a later opener that opens a payload blocks.  A marker the model
+        quoted a second time in prose opens nothing, so that tail stays
+        recoverable prose (#4300 review, Barty13's code-fence reproduction):
+        judging every repeat as a call cost the non-streaming caller the whole
+        answer while the same text streamed back intact.
+
+        Walks the tail once.  Each opener keeps its own forward cursor, so no
+        suffix is copied or rescanned per marker: a tail that repeats the marker
+        is linear rather than quadratic (#1854/#1905).
+
+        Must be read before ``take_recovery_candidate`` drains the text.
+        """
+
+        tail = self._recovery_candidate
+        if not tail:
+            return False
+        # The first opener owns the head of the tail, so later ones start after
+        # it -- including the longest matching marker, as ``_withheld_opener``
+        # resolves overlapping spellings.
+        start = len(self._withheld_opener(tail))
+        # Next position of each opener, or -1 once it stops appearing.  Advancing
+        # one cursor at a time is what keeps a marker-heavy tail linear: no
+        # opener is ever searched from the front twice.
+        cursors = {
+            marker: tail.find(marker, start)
+            for marker, _close in self._marker_pairs
+            if marker
+        }
+        while True:
+            found = [
+                (index, marker) for marker, index in cursors.items() if index != -1
+            ]
+            if not found:
+                return False
+            index, marker = min(found)
+            if self._withheld_payload_at(tail, index):
+                return True
+            cursors[marker] = tail.find(marker, index + len(marker))
 
     def take_completed_envelopes(self) -> List[str]:
         """Return complete suppressed envelopes ready for exact parsing.
@@ -3283,6 +3346,70 @@ class ToolCallStreamFilter:
 
         return "".join(out)
 
+    def _withheld_opener(self, withheld: str) -> str:
+        """Return the opening envelope marker ``withheld`` starts with.
+
+        Longest matching marker wins so an overlapping tokenizer-supplied
+        marker cannot shadow a more specific built-in pair.
+        """
+
+        opener = ""
+        for start_marker, _close in self._marker_pairs:
+            if (
+                start_marker
+                and withheld.startswith(start_marker)
+                and len(start_marker) > len(opener)
+            ):
+                opener = start_marker
+        return opener
+
+    def _withheld_is_payload(self, withheld: str) -> bool:
+        """Whether the tail withheld at EOF is a truncated call, not prose.
+
+        The terminal parser reports ``incomplete`` for a control marker the
+        model merely quoted in prose exactly as it does for a call the stream
+        cut short (#4241), so the shape of the tail decides.  Three forms are
+        payloads by construction:
+
+        * the opener *is* the call syntax (``<function=``), so nothing was
+          quoted -- a bare attribute-function call was cut mid-argument;
+        * nothing follows the opener, which is a call cut at its own marker,
+          never a sentence; recovering it would leak the control marker;
+        * the tail opens the way a payload grammar does: ``<``, ``{``, ``[``,
+          or Gemma's ``call:name{...}``.
+        """
+
+        return self._withheld_payload_at(withheld, 0)
+
+    def _withheld_payload_at(self, withheld: str, index: int) -> bool:
+        """``_withheld_is_payload`` for an opener already located at ``index``.
+
+        Indexing instead of slicing keeps ``recovery_tail_has_later_opener``
+        linear when the tail repeats the marker: the suffix is never copied,
+        and only the byte after the opener decides, so a bounded lookahead
+        replaces the whole-body ``lstrip``.
+        """
+
+        opener = ""
+        for marker, _close in self._marker_pairs:
+            if (
+                marker
+                and withheld.startswith(marker, index)
+                and len(marker) > len(opener)
+            ):
+                opener = marker
+        if opener == _XML_FUNCTION_OPEN:
+            return True
+        pos = index + len(opener)
+        end = len(withheld)
+        while pos < end and withheld[pos].isspace():
+            pos += 1
+        if pos >= end:
+            return True
+        if withheld[pos] in "<{[":
+            return True
+        return withheld.startswith("call:", pos)
+
     def _unwind_withheld_at_eof(
         self, candidate: str, marker: str, start_marker: str
     ) -> str:
@@ -3328,6 +3455,12 @@ class ToolCallStreamFilter:
                 withheld = candidate[env_start:]
                 if withheld:
                     self._recovery_candidate = withheld
+                    # A model that quotes a literal control marker in prose
+                    # opens the same envelope as a real call and ends the turn
+                    # the same way, so only a prose-shaped tail is recoverable;
+                    # a payload-shaped one (including a bare
+                    # ``<function=...`` call) stays a failed call (#4241).
+                    self._recovery_is_payload = self._withheld_is_payload(withheld)
                     logger.warning(
                         "Unclosed tool-call envelope at end of stream; "
                         "withheld %d characters are available for content "

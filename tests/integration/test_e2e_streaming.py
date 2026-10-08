@@ -4901,6 +4901,518 @@ async def test_qwen_closed_envelope_with_unclosed_parameter_never_emits_call():
     assert events[-1]["error"]["code"] == "invalid_tool_call"
 
 
+# --- #4241: withheld prose is content, a truncated payload is still a failure.
+
+# Prose that quotes the control marker literally. The marker opens an envelope
+# the filter then withholds to EOF, but nothing here is a tool call payload.
+_RECOVERY_PROSE = (
+    "The tag <tool_call> is how qwen calls a tool. "
+    "This sentence must survive. END"
+)
+
+
+def _recovery_text(events, api):
+    if api == "chat":
+        return "".join(
+            c.get("delta", {}).get("content") or ""
+            for e in events
+            for c in e.get("choices", [])
+        )
+    if api == "anthropic":
+        return "".join(
+            e.get("delta", {}).get("text") or ""
+            for e in events
+            if e.get("type") == "content_block_delta"
+        )
+    return "".join(
+        e.get("delta") or ""
+        for e in events
+        if e.get("type") == "response.output_text.delta"
+    )
+
+
+def _recovery_error_codes(events, api):
+    codes = [e["error"]["code"] for e in events if "error" in e]
+    if api == "responses":
+        codes += [
+            e["response"]["error"]["code"]
+            for e in events
+            if e.get("type") == "response.failed"
+        ]
+    return codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize("chunk_size", [1, 7, 4096])
+async def test_withheld_prose_after_literal_marker_is_delivered(api, chunk_size):
+    """A marker quoted in prose must not discard the text behind it."""
+    events = await _recovery_stream(_RECOVERY_PROSE, api, chunk_size=chunk_size)
+
+    assert _recovery_error_codes(events, api) == []
+    assert _recovery_text(events, api) == _RECOVERY_PROSE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # XML payload opener, the shape a real qwen call has.
+        "<tool_call><function=write><parameter=content>cut",
+        # JSON object and array payload openers are equally structured.
+        '<tool_call>{"name":"write","arguments":{"content":"cut',
+        '<tool_call>[{"name":"write","arguments":{"content":"cut',
+    ],
+)
+async def test_truncated_tool_payload_is_never_recovered_as_content(api, raw):
+    """Counter-example: a withheld payload keeps the 500 and stays hidden."""
+    events = await _recovery_stream(raw, api)
+
+    assert _recovery_error_codes(events, api) == ["incomplete_tool_call"]
+    assert not _recovery_calls(events, api)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_truncated_sibling_of_a_delivered_call_keeps_the_error(api):
+    """Counter-example: a valid prefix is delivered once, the tail still fails."""
+    raw = _RECOVERY_CALL + "<tool_call><function=write><parameter=content>cut"
+    events = await _recovery_stream(raw, api)
+
+    assert _recovery_error_codes(events, api) == ["incomplete_tool_call"]
+    assert len(_recovery_calls(events, api)) == 1
+    assert "cut" not in _recovery_text(events, api)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # The opener is the call syntax itself, so nothing was quoted: this is
+        # a bare attribute-function call cut mid-argument.
+        "<function=write><parameter=content>cut",
+        # A marker with nothing behind it is a call cut at its own marker.
+        "<tool_call>",
+    ],
+)
+async def test_call_syntax_envelope_is_never_recovered_as_content(api, raw):
+    """Counter-example: these tails are payloads, not prose (#4241 review)."""
+    events = await _recovery_stream(raw, api)
+
+    assert _recovery_error_codes(events, api) == ["incomplete_tool_call"]
+    assert not _recovery_calls(events, api)
+    assert _recovery_text(events, api) == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_recovered_prose_reaches_the_authoritative_final_text(api):
+    """The recovered tail must reach the final object, not only the deltas."""
+    events = await _recovery_stream(_RECOVERY_PROSE, api)
+
+    streamed = _recovery_text(events, api)
+    assert "This sentence must survive. END" in streamed
+
+    if api == "responses":
+        tail = "This sentence must survive. END"
+        done = [
+            e.get("text")
+            for e in events
+            if e.get("type") == "response.output_text.done"
+        ]
+        assert [t for t in done if t.endswith(tail)], done
+        completed = [
+            item["content"][0]["text"]
+            for e in events
+            if e.get("type") == "response.completed"
+            for item in e["response"].get("output", [])
+            if item.get("type") == "message"
+        ]
+        assert [t for t in completed if t.endswith(tail)], completed
+
+
+@pytest.mark.asyncio
+async def test_withheld_prose_never_reports_a_tool_call_finish():
+    """Recovering prose must not look like a tool turn to the client."""
+    events = await _recovery_stream(_RECOVERY_PROSE, "chat")
+
+    assert not _recovery_calls(events, "chat")
+    assert [
+        c.get("finish_reason")
+        for e in events
+        for c in e.get("choices", [])
+        if c.get("finish_reason")
+    ] == ["stop"]
+
+
+@pytest.mark.asyncio
+async def test_delivered_call_is_not_recovered_and_not_reexecuted():
+    """Counter-example: a call already delivered keeps the 500, emitted once.
+
+    Recovery is refused whenever anything structured is in flight, so the
+    client is never told to run a delivered call a second time.
+    """
+    raw = _RECOVERY_CALL + " then <tool_call> prose that must not be recovered. END"
+    events = await _recovery_stream(raw, "chat")
+
+    assert [e["error"]["code"] for e in events if "error" in e] == [
+        "incomplete_tool_call"
+    ]
+    assert _recovery_text(events, "chat") == " then "
+    assert len(_recovery_calls(events, "chat")) == 1
+
+
+@pytest.mark.asyncio
+async def test_partially_streamed_call_never_emits_call_or_recovery():
+    """Counter-example: a call cut mid-arguments yields neither side."""
+    events = await _recovery_stream(
+        "<tool_call><function=write><parameter=content>half a sen",
+        "chat",
+    )
+
+    assert not _recovery_calls(events, "chat")
+    assert [e["error"]["code"] for e in events if "error" in e] == [
+        "incomplete_tool_call"
+    ]
+    assert _recovery_text(events, "chat") == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_withheld_prose_is_delivered_exactly_once(api):
+    """Counter-example: repeated recovery must not duplicate answer text."""
+    events = await _recovery_stream(_RECOVERY_PROSE + " " + _RECOVERY_PROSE, api)
+
+    assert _recovery_text(events, api).count("END") == 2
+    assert _recovery_error_codes(events, api) == []
+
+
+# --- #4300 review: a quoted marker is prose, a real failure is never hidden.
+
+# A call whose envelope *closed* but whose markup is broken: the terminal
+# parser reports "malformed", so this turn must keep failing even when a quoted
+# marker further down the output opens an unclosed envelope that the recovery
+# path could deliver.
+_REVIEW_MALFORMED_CLOSED = (
+    "<tool_call><function=write><parameter=content>cut</tool_call>"
+)
+_REVIEW_QUOTED = " The tag <tool_call> is how qwen calls a tool. END"
+_REVIEW_TRUNCATED_CALL = '<tool_call>{"name":"write","arguments":{"content":"cut'
+_REVIEW_PROSE_THEN_CALL = (
+    "The tag <tool_call> is how qwen calls a tool. Now calling: "
+    + _REVIEW_TRUNCATED_CALL
+)
+_REVIEW_TRUNCATED_XML = "<tool_call><function=write><parameter=content>cut"
+# Barty13's reproduction: the withheld tail is plain prose that names the
+# marker a second time, inside a fence.  Nothing behind that repeat is a payload.
+_REVIEW_MARKER_REPEAT_PROSE = (
+    "The tag <tool_call> is how qwen calls a tool. It is named again in a "
+    "fence:\n```\n<tool_call>\n```\nOnly the name is quoted. END"
+)
+
+
+def _recovery_reasoning(events, api):
+    if api == "chat":
+        return "".join(
+            c.get("delta", {}).get("reasoning_content") or ""
+            for e in events
+            for c in e.get("choices", [])
+        )
+    if api == "anthropic":
+        return "".join(
+            e.get("delta", {}).get("thinking") or ""
+            for e in events
+            if e.get("type") == "content_block_delta"
+        )
+    return "".join(
+        e.get("delta") or ""
+        for e in events
+        if e.get("type") == "response.reasoning_summary_text.delta"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_closed_malformed_call_is_not_dropped_by_a_quoted_marker(api):
+    """Recovering prose must not clear a failure the prose did not cause.
+
+    The withheld tail is a quoted marker (a recoverable shape), but the
+    "malformed" verdict comes from an envelope that closed earlier, so the turn
+    must still fail rather than end as ``stop`` with the call silently dropped
+    (#4300 review, item 1).
+    """
+    events = await _recovery_stream(_REVIEW_MALFORMED_CLOSED + _REVIEW_QUOTED, api)
+
+    assert _recovery_error_codes(events, api) == ["incomplete_tool_call"]
+    assert not _recovery_calls(events, api)
+    assert _recovery_text(events, api) == " The tag "
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_thinking_channel_quoted_marker_keeps_the_malformed_call_error(api):
+    """The same shape with the quoted marker in the thinking channel (#4300)."""
+    raw = _REVIEW_MALFORMED_CLOSED + "<think>" + _REVIEW_QUOTED + "</think>"
+    events = await _recovery_stream(raw, api)
+
+    assert _recovery_error_codes(events, api) == ["invalid_tool_call"]
+    assert not _recovery_calls(events, api)
+    # The withheld tail is refused, not laundered into reasoning text.
+    assert _recovery_reasoning(events, api) == " The tag "
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_thinking_channel_truncated_call_still_streams_pending_review(api):
+    """Known gap, deliberately unchanged until the maintainer settles it.
+
+    A call cut short inside the thinking channel carries no parser failure at
+    all: the terminal parser only reads the content channel, so there is nothing
+    for the recovery gate to keep and the payload flag alone cannot refuse the
+    tail without also changing the documented ``finish_reason="length"``
+    recovery contract on the content channel.  Reported with item 1 of the #4300
+    review rather than changed here.
+    """
+    events = await _recovery_stream(
+        "<think>" + _REVIEW_TRUNCATED_CALL + "</think>", api
+    )
+
+    assert not _recovery_calls(events, api)
+    assert _recovery_text(events, api) == ""
+    assert _recovery_reasoning(events, api) == _REVIEW_TRUNCATED_CALL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_prose_then_later_call_opener_is_not_streamed_as_content(api):
+    """Answer (a): the leading prose is delivered, the tail is held, it fails.
+
+    The withheld tail opens with a quoted marker, so judging it by the bytes
+    right after that marker calls the whole thing prose -- but the call opener
+    further inside it is payload-shaped, and delivering that tail is the #3834
+    leak direction.  vogel61 settled the (a)/(b) question on #4300 as (a): the
+    text before the first marker stays content, the tail is never delivered,
+    and the turn still fails as an incomplete call.
+    """
+    events = await _recovery_stream(_REVIEW_PROSE_THEN_CALL, api)
+
+    assert _recovery_error_codes(events, api) == ["incomplete_tool_call"]
+    assert not _recovery_calls(events, api)
+    assert _recovery_text(events, api) == "The tag "
+
+
+def _nonstream_tool_call_client(monkeypatch, body: str):
+    """A client whose model always generates ``body`` for a non-stream request.
+
+    Wired like ``_recovery_stream`` (qwen3_coder parser plus ``<tool_call>``
+    markers) so the terminal parser reaches the ``incomplete`` state the
+    non-streaming recovery path keys on.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from fastapi.testclient import TestClient
+    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+    from omlx.engine.batched import BatchedEngine
+    from omlx.server import _server_state, app
+
+    engine = BatchedEngine("test-model")
+    engine._loaded = True
+    engine._model = SimpleNamespace(args=SimpleNamespace(model_type="qwen3"))
+    engine._tokenizer = MockTokenizer()
+    engine._tokenizer.has_tool_calling = True
+    engine._tokenizer.tool_call_start = "<tool_call>"
+    engine._tokenizer.tool_call_end = "</tool_call>"
+    engine._tokenizer.tool_parser = parse_tool_call
+    engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
+    monkeypatch.setattr(engine, "_preflight_or_raise_with_eviction", AsyncMock())
+
+    output = MockGenerationOutput(
+        text=body,
+        new_text=body,
+        completion_tokens=4,
+        finished=True,
+        finish_reason="stop",
+    )
+    monkeypatch.setattr(engine, "generate", AsyncMock(return_value=output))
+
+    async def generate_stream(*args, **kwargs):
+        yield output
+
+    monkeypatch.setattr(engine, "stream_generate", generate_stream)
+    monkeypatch.setattr(_server_state, "engine_pool", MockEnginePool(engine))
+    monkeypatch.setattr(_server_state, "default_model", "test-model")
+    return TestClient(app)
+
+
+_ANTHROPIC_REVIEW_TOOLS = [
+    {
+        "name": "write",
+        "description": "Write content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"],
+        },
+    }
+]
+_RESPONSES_REVIEW_TOOLS = [
+    {
+        "type": "function",
+        "name": "write",
+        "parameters": {
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"],
+        },
+    }
+]
+_CHAT_REVIEW_PAYLOAD = {
+    "model": "test-model",
+    "messages": [{"role": "user", "content": "Write hello"}],
+    "stream": False,
+    "tools": _RECOVERY_TOOLS,
+}
+_ANTHROPIC_REVIEW_PAYLOAD = {
+    "model": "test-model",
+    "max_tokens": 128,
+    "messages": [{"role": "user", "content": "Write hello"}],
+    "tools": _ANTHROPIC_REVIEW_TOOLS,
+}
+_RESPONSES_REVIEW_PAYLOAD = {
+    "model": "test-model",
+    "input": "Write hello",
+    "store": False,
+    "tools": _RESPONSES_REVIEW_TOOLS,
+}
+
+
+def test_nonstream_quoted_marker_is_delivered(monkeypatch):
+    """#4241 on the non-streaming chat path: the quoted prose is the answer."""
+    client = _nonstream_tool_call_client(monkeypatch, _RECOVERY_PROSE)
+    response = client.post("/v1/chat/completions", json=_CHAT_REVIEW_PAYLOAD)
+    client.close()
+
+    assert response.status_code == 200, response.text
+    choice = response.json()["choices"][0]
+    assert choice["message"]["content"] == _RECOVERY_PROSE
+    assert not choice["message"].get("tool_calls")
+    assert choice["finish_reason"] == "stop"
+
+
+@pytest.mark.parametrize(
+    "path,payload",
+    [
+        ("/v1/messages", _ANTHROPIC_REVIEW_PAYLOAD),
+        ("/v1/responses", _RESPONSES_REVIEW_PAYLOAD),
+    ],
+)
+def test_nonstream_quoted_marker_reaches_other_api_bodies(monkeypatch, path, payload):
+    """The non-streaming recovery must cover all three API shapes (#4300)."""
+    client = _nonstream_tool_call_client(monkeypatch, _RECOVERY_PROSE)
+    response = client.post(path, json=payload)
+    client.close()
+
+    assert response.status_code == 200, response.text
+    if path == "/v1/messages":
+        assert response.json()["content"][0]["text"] == _RECOVERY_PROSE
+    else:
+        texts = [
+            part["text"]
+            for item in response.json()["output"]
+            if item["type"] == "message"
+            for part in item["content"]
+        ]
+        assert texts == [_RECOVERY_PROSE]
+
+
+@pytest.mark.parametrize(
+    "raw,code",
+    [
+        (_REVIEW_TRUNCATED_CALL, "incomplete_tool_call"),
+        (_REVIEW_TRUNCATED_XML, "incomplete_tool_call"),
+        (_REVIEW_PROSE_THEN_CALL, "incomplete_tool_call"),
+        (_REVIEW_MALFORMED_CLOSED, "invalid_tool_call"),
+        (
+            _REVIEW_MALFORMED_CLOSED + _REVIEW_QUOTED,
+            "incomplete_tool_call",
+        ),
+    ],
+)
+def test_nonstream_truncated_or_malformed_call_still_fails(monkeypatch, raw, code):
+    """A call the generator cut short must keep the 500 on the non-stream path.
+
+    Recovery there is additionally gated on the withheld tail holding no
+    payload-shaped opener after its first marker (#4300 review, item 3): without
+    that guard the leading prose would be judged alone and
+    ``... Now calling: <tool_call>{"name": ...cut`` would be returned as answer
+    text.  A marker merely repeated in prose opens nothing, so it no longer
+    blocks the tail (see the ``_REVIEW_MARKER_REPEAT_PROSE`` case).
+    """
+    client = _nonstream_tool_call_client(monkeypatch, raw)
+    response = client.post("/v1/chat/completions", json=_CHAT_REVIEW_PAYLOAD)
+    client.close()
+
+    assert response.status_code == 500, response.text
+    assert response.json()["error"]["code"] == code
+    assert "<tool_call>" not in response.text
+
+
+@pytest.mark.parametrize(
+    "path,payload",
+    [
+        ("/v1/chat/completions", _CHAT_REVIEW_PAYLOAD),
+        ("/v1/messages", _ANTHROPIC_REVIEW_PAYLOAD),
+        ("/v1/responses", _RESPONSES_REVIEW_PAYLOAD),
+    ],
+)
+def test_nonstream_marker_repeat_in_prose_is_delivered(monkeypatch, path, payload):
+    """A repeat of the marker in prose must not cost the caller the answer.
+
+    Barty13's #4300 reproduction: the same text streamed back intact while the
+    non-streaming path answered 500, because the guard refused the tail for any
+    later opener.  It now judges the text behind each later opener, so only a
+    payload-shaped one blocks.
+    """
+    client = _nonstream_tool_call_client(monkeypatch, _REVIEW_MARKER_REPEAT_PROSE)
+    response = client.post(path, json=payload)
+    client.close()
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    if path == "/v1/chat/completions":
+        assert body["choices"][0]["message"]["content"] == _REVIEW_MARKER_REPEAT_PROSE
+    elif path == "/v1/messages":
+        assert body["content"][0]["text"] == _REVIEW_MARKER_REPEAT_PROSE
+    else:
+        texts = [
+            part["text"]
+            for item in body["output"]
+            if item["type"] == "message"
+            for part in item["content"]
+        ]
+        assert texts == [_REVIEW_MARKER_REPEAT_PROSE]
+
+
+@pytest.mark.parametrize(
+    "path,payload",
+    [
+        ("/v1/messages", _ANTHROPIC_REVIEW_PAYLOAD),
+        ("/v1/responses", _RESPONSES_REVIEW_PAYLOAD),
+    ],
+)
+def test_nonstream_truncated_call_fails_on_other_apis(monkeypatch, path, payload):
+    client = _nonstream_tool_call_client(monkeypatch, _REVIEW_TRUNCATED_CALL)
+    response = client.post(path, json=payload)
+    client.close()
+
+    assert response.status_code == 500, response.text
+    assert response.json()["error"]["code"] == "incomplete_tool_call"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
 @pytest.mark.parametrize("raw", [_RECOVERY_CALL, "<tool_call><function=write>"])

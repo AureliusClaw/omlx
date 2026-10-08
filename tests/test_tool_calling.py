@@ -1622,6 +1622,162 @@ def test_payload_without_any_close_marker_is_still_withheld():
     assert f.take_recovery_candidate() == '<tool_call>{"name":"f" After'
 
 
+@pytest.mark.parametrize(
+    "withheld,is_payload",
+    [
+        # Prose that quotes the marker: recoverable as content (#4241).
+        ("<tool_call> is how qwen calls a tool. END", False),
+        ("<tool_call> to call anything. END", False),
+        ("<tool_call> then write to save. END", False),
+        ("<|tool_call_start|> is the Hermes form. END", False),
+        # Structured payload openers: a truncated call, never content.
+        ('<tool_call>{"name":"f"', True),
+        ('<tool_call>[{"name":"f"', True),
+        ("<tool_call><function=write><parameter=x>", True),
+        ('<|tool_call_start|>{"name":"f"', True),
+        # The opener is the call syntax itself, so nothing was quoted: this is
+        # a bare attribute-function call cut mid-argument (#4241 review).
+        ("<function=write><parameter=content>cut", True),
+        # A marker with nothing behind it is a call cut at its own marker;
+        # recovering it would leak the control token into the answer.
+        ("<tool_call>", True),
+        ("<tool_call>   ", True),
+    ],
+)
+def test_recovery_candidate_classifies_payload_versus_prose(withheld, is_payload):
+    """Only payload-shaped tails are a failed call; prose is recoverable."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed(withheld)
+    f.finish()
+
+    assert f.take_recovery_is_payload() is is_payload
+    # The flag drains with the text so a second read cannot re-apply it.
+    assert f.take_recovery_candidate() == withheld
+    assert f.take_recovery_is_payload() is False
+
+
+def test_closed_envelope_leaves_no_recovery_payload_flag():
+    """A correctly closed call must not arm the payload flag."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed('<tool_call>{"name":"f"}</tool_call>')
+    f.finish()
+
+    assert f.take_recovery_candidate() == ""
+    assert f.take_recovery_is_payload() is False
+
+
+def test_gemma_style_payload_opener_is_classified_as_payload():
+    """A native ``call:name{...}`` payload is a call, not prose (#4241)."""
+
+    f = ToolCallStreamFilter(
+        _make_tokenizer_with_end("<|tool_call>", "<|tool_call|>")
+    )
+
+    f.feed('<|tool_call>call:get_weather{city:"Seat')
+    f.finish()
+
+    assert f.take_recovery_is_payload() is True
+    assert f.take_recovery_candidate() == '<|tool_call>call:get_weather{city:"Seat'
+
+
+def test_recovery_tail_without_a_second_marker_is_recoverable():
+    """Prose that quotes the marker once has no later opener (#4300)."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed("<tool_call> is how qwen calls a tool. END")
+    f.finish()
+
+    assert f.recovery_tail_has_later_opener() is False
+    assert f.take_recovery_candidate() == "<tool_call> is how qwen calls a tool. END"
+
+
+def test_recovery_tail_with_a_second_marker_is_refused():
+    """A payload-shaped later opener must be visible (#4300)."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed(
+        "<tool_call> is how qwen calls a tool. Now calling: "
+        '<tool_call>{"name":"write"'
+    )
+    f.finish()
+
+    assert f.recovery_tail_has_later_opener() is True
+    # The guard must not drain the candidate other readers still need.
+    assert f.take_recovery_candidate().startswith(
+        "<tool_call> is how qwen calls a tool. Now calling:"
+    )
+
+
+def test_recovery_tail_with_a_second_marker_in_prose_is_recoverable():
+    """A repeat of the marker in prose opens nothing, so the tail is prose.
+
+    Barty13's #4300 reproduction: the withheld tail is ordinary prose that
+    names the marker a second time inside a fence.  Refusing every repeat kept
+    the non-streaming caller at a hard 500 while the same text streamed back
+    intact.
+    """
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed(
+        "<tool_call> is how qwen calls a tool. It is named again in a fence:\n"
+        "```\n<tool_call>\n```\nOnly the name is quoted. END"
+    )
+    f.finish()
+
+    assert f.recovery_tail_has_later_opener() is False
+    assert f.take_recovery_candidate().endswith("Only the name is quoted. END")
+
+
+def test_recovery_tail_scan_passes_prose_before_a_later_payload_opener():
+    """The scan judges each later opener, so prose markers do not mask a call."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed(
+        "<tool_call> is how qwen calls a tool. Named again: "
+        "<tool_call> in prose. Now calling: "
+        '<tool_call>{"name":"write"'
+    )
+    f.finish()
+
+    assert f.recovery_tail_has_later_opener() is True
+
+
+def test_recovery_tail_guard_sees_a_later_naked_function_opener():
+    """``<function=`` is an opener too, with no ``<tool_call>`` around it."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    f.feed("The tag <tool_call> is how qwen calls a tool. Now calling: <function=write>")
+    f.finish()
+
+    assert f.recovery_tail_has_later_opener() is True
+
+
+def test_recovery_tail_guard_is_false_without_a_withheld_tail():
+    """A closed envelope leaves no candidate, so there is nothing to judge."""
+
+    f = ToolCallStreamFilter(_make_tokenizer())
+
+    assert f.recovery_tail_has_later_opener() is False
+
+    f.feed(
+        "<tool_call><function=write><parameter=x>done</parameter>"
+        "</function></tool_call>"
+    )
+    f.finish()
+
+    assert f.take_recovery_candidate() == ""
+    assert f.recovery_tail_has_later_opener() is False
+
+
 def test_close_marker_fallback_rescans_the_recovered_tail():
     """Prose recovered after a close marker is re-filtered, not emitted raw."""
     f = ToolCallStreamFilter(_make_tokenizer())
