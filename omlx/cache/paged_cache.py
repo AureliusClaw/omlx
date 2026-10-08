@@ -783,11 +783,7 @@ class PagedCacheManager(CacheManager):
                     self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
                     self._notify_hash_dropped(block.block_hash)
 
-                # Preserve the "free-queue blocks carry no hash" invariant:
-                # cold_block_count() and the ref-count distribution count
-                # blocks by block_hash, and _maybe_evict_cached_block() at
-                # reallocation relies on a stale hash never surviving a free
-                # (mirrors evict_block_permanently's reset_hash).
+                # Free-queue blocks carry no hash or token count.
                 block.reset_hash()
                 self.stats.total_tokens_cached -= block.token_count
                 block.token_count = 0
@@ -830,8 +826,7 @@ class PagedCacheManager(CacheManager):
                         self.cached_block_hash_to_block.pop(block.block_hash, block.block_id)
                         self._notify_hash_dropped(block.block_hash)
 
-                    # Same invariant as free_block(): no stale hash or
-                    # token_count survives into the free queue.
+                    # Free-queue blocks carry no hash or token count.
                     block.reset_hash()
                     self.stats.total_tokens_cached -= block.token_count
                     block.token_count = 0

@@ -307,8 +307,7 @@ class TestBoundarySnapshotSSDStore:
 
         request_id = "req-staging"
         last_final = self.store._file_path(request_id, 3072)
-        # Temp names carry a per-writer suffix (_unique_tmp_path); match the
-        # last boundary's temp by prefix instead of an exact name.
+        # Temp names carry a per-writer suffix.
         last_tmp_prefix = last_final.stem + "_tmp"
         original_write = mod._write_safetensors_no_mx
         promoted: list[Path | None] = []

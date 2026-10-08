@@ -529,13 +529,7 @@ class TestPagedCacheManager:
         assert block_id not in manager.allocated_blocks
 
     def test_free_block_clears_hash_and_token_count(self):
-        """Free-queue blocks must carry no stale hash or token_count.
-
-        cold_block_count() and the ref-count distribution count blocks by
-        block_hash across all blocks; a stale hash on a freed block
-        over-reports SSD presence and breaks the reallocation path's
-        reset assumptions.
-        """
+        """Free-queue blocks must carry no stale hash or token_count."""
         manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
 
         block = manager.allocate_block()

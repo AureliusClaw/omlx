@@ -70,9 +70,8 @@ _PENDING_WRITES_HARD_RAM_FRACTION = 0.30
 _PENDING_WRITES_SOFT_FLOOR = 32
 _PENDING_WRITES_CEILING = 256
 _PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
-# Unreadable tmp files younger than this are left alone during the startup
-# scan: the cache directory can be shared with a live manager whose
-# in-flight tmp is briefly unreadable mid-write. Well past any real write.
+# Startup keeps unreadable tmp files newer than this; another manager may
+# still be writing them.
 _STALE_TMP_CLEANUP_SECONDS = 600.0
 
 # Conservative defaults for the per-block cost estimator. The actual
@@ -932,13 +931,8 @@ def _fsync_parent_dir(path: str | Path) -> None:
 def _unique_tmp_path(file_path: Path) -> Path:
     """Build a per-writer temp path for ``file_path``.
 
-    The classic ``<stem>_tmp.safetensors`` name is derived only from the
-    final path, so the inline write fallback can race the background writer
-    (or a second manager sharing the directory) on the same block and
-    interleave two writes into one file; the later rename then commits
-    whichever bytes happened to land last. A unique suffix keeps every
-    writer on its own file while staying recoverable: the startup scan
-    globs ``*.safetensors`` and reads metadata from tmp files directly.
+    A shared ``<stem>_tmp`` name lets two writers of one block interleave
+    their bytes in a single file.
     """
     return file_path.with_name(
         f"{file_path.stem}_tmp_{uuid.uuid4().hex[:8]}.safetensors"
@@ -1944,10 +1938,7 @@ class PagedSSDCacheManager(CacheManager):
     def _handle_hot_cache_eviction(self, block_hash: bytes, entry: dict) -> None:
         self._stats["hot_cache_evictions"] += 1
         if entry.get("staging"):
-            # Transient read-back buffer for an in-flight first write: the
-            # SSD write is already queued; enqueueing again would write the
-            # file twice. Drop the entry only.
-            return
+            return  # Its SSD write is already queued.
         if not entry.get("dirty", True):
             logger.debug(
                 "Evicted clean hot cache block %s; SSD copy already exists",
@@ -2377,17 +2368,8 @@ class PagedSSDCacheManager(CacheManager):
                 try:
                     metadata = self._read_file_metadata(file_path)
                     if metadata is None:
-                        # Unreadable tmp files are torn writes by definition
-                        # (a completed write renames them away); without this
-                        # they'd linger forever outside every index and
-                        # budget. Only tmp files older than a generous write
-                        # window are removed — the directory can be shared
-                        # with a live manager whose in-flight tmp is briefly
-                        # unreadable mid-write, and unlinking it would fail
-                        # its rename. Unreadable final-named files are left
-                        # on disk and only counted — deleting non-tmp cache
-                        # files automatically at startup would mask data-
-                        # losing bugs (e.g. an fs regression).
+                        # An unreadable tmp file is a torn write. Skip recent
+                        # ones, which another manager may still be writing.
                         stem = file_path.stem
                         try:
                             tmp_is_stale = (
@@ -3744,14 +3726,7 @@ class PagedSSDCacheManager(CacheManager):
             cache_entry["staging"] = True
             with self._hot_cache_lock:
                 self._hot_cache[block_hash] = cache_entry
-                # Account symmetrically with _hot_cache_remove(), which
-                # always subtracts on pop: without this the counter drifts
-                # negative by each staging block's size, skewing
-                # hot_cache_size_bytes and defeating shrink targets.
-                # Staging entries are marked so shrink/eviction skips them:
-                # their SSD write is already queued, and re-handling one
-                # would queue a duplicate write and report bytes freed that
-                # the queue still holds.
+                # Match the subtraction in _hot_cache_remove().
                 self._hot_cache_total_bytes += self._hot_cache_entry_size(
                     cache_entry
                 )

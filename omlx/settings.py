@@ -205,11 +205,7 @@ class ServerSettings:
     max_audio_upload_size: str = "100MB"
     # Maximum raw image payload size accepted ("50MB", "100MB").
     max_image_upload_size: str = "50MB"
-    # Transport-level cap on any single request body (JSON prompts,
-    # guided_grammar / json_schema, base64 media, multipart uploads). Must
-    # stay above max_audio_upload_size plus base64 expansion and any
-    # realistic multi-image payload; the per-endpoint limits below still
-    # apply on top of it.
+    # Cap on any request body.
     max_request_body_size: str = "512MB"
     # Maximum side length in pixels for VLM input images (0 to disable downscaling).
     max_image_side_length: int = 2048

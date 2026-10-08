@@ -247,9 +247,7 @@ class VisionFeatureSSDCache:
     def _memory_put(self, key: str, features: Any) -> bool:
         """Insert into memory LRU, evicting oldest if over limits.
 
-        Returns whether the entry is still resident: a single entry larger
-        than the whole budget is evicted by its own insert. Callers use the
-        result to skip bookkeeping (the grid map) for non-resident keys.
+        Returns False when an entry larger than the budget evicts itself.
 
         Caller must hold _memory_lock.
         """
@@ -262,9 +260,7 @@ class VisionFeatureSSDCache:
         self._memory_cache[key] = features
         self._memory_entry_bytes[key] = nbytes
 
-        # Evict oldest if over either limit. Also covers the replace path:
-        # overwriting a key with a bigger tensor could otherwise push
-        # _memory_bytes past the budget until the next fresh insert.
+        # Evict oldest if over either limit, including after a replace.
         while self._memory_cache and (
             self._memory_bytes > self._max_memory_bytes
             or len(self._memory_cache) > self._max_memory_entries

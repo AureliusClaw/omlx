@@ -618,9 +618,7 @@ def write_credentials_ref(credentials_path: Path, ref_name: str, value: str) -> 
         )
 
     # The harness refuses to load a credential store with group/other bits.
-    # Create with 0600 up front so the plaintext key is never briefly
-    # world-readable under the default umask; chmod stays for rewrites of
-    # a pre-existing file with looser bits.
+    # Create it 0600 so the key is never world-readable, even briefly.
     credentials_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _write_config(credentials_path, text, secret=True)
     credentials_path.chmod(0o600)

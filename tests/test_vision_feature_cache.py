@@ -319,13 +319,12 @@ class TestSSDCache:
 
         assert key not in ssd_cache._ssd_index
         assert ssd_cache._ssd_total_size == 0
-        # The temp name carries a per-writer suffix; recover the actual
-        # leftover instead of predicting it.
+        # Temp names carry a per-writer suffix.
         leftover_tmps = list(
             file_path.parent.glob(f"{file_path.stem}_tmp*.safetensors")
         )
         assert leftover_tmps, "failed write should leave its temp file behind"
-        for path in ([file_path, *leftover_tmps]):
+        for path in (file_path, *leftover_tmps):
             assert path.exists()
             assert any(
                 r.levelno == logging.WARNING
