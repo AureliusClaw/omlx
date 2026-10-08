@@ -1558,12 +1558,6 @@ class Glm5NextMoEGate(nn.Module):
         self.weight = mx.zeros((config.n_routed_experts, config.hidden_size))
         self.e_score_correction_bias = mx.zeros((config.n_routed_experts,))
 
-    def to_quantized(self, group_size=64, bits=4, mode="affine"):
-        # Explicit checkpoint recipes can bypass the model quant_predicate.
-        # This router consumes only floating weights restored by sanitize;
-        # keep it dense when the loader applies those recipes.
-        return self
-
     def __call__(self, x):
         if (
             _DECODE_FUSION
@@ -1964,8 +1958,7 @@ def _dequantize_router_gates(weights, hidden_size):
                 f"{weight_key}: cannot infer quantization from shapes "
                 f"{tuple(packed.shape)} / {tuple(scales.shape)}"
             )
-        # Unlike Linear, the MoE router has no quantized module to consume
-        # scales/biases. Stock bf16 gates are also promoted to fp32 below.
+        # The router has no quantized module, so restore fp32 like stock gates.
         weights[weight_key] = mx.dequantize(
             packed,
             scales,

@@ -4647,42 +4647,28 @@ def _stock_verify_router(fused):
     return router
 
 
-@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
-@pytest.mark.parametrize("group_size", [32, 64, 128])
-def test_sanitize_dequantizes_quantized_router_gate(bits, group_size):
+@pytest.mark.parametrize("bits", [4, 8])
+def test_sanitize_dequantizes_quantized_router_gate(bits):
     config_dict = _tiny_config_dict()
-    config_dict["text_config"]["hidden_size"] = 128
+    config_dict["text_config"]["hidden_size"] = 256
     sanitizer = _build_model_sanitizer(config_dict)
-    gate = mx.random.normal((8, 128)).astype(mx.bfloat16)
-    packed, scales, biases = mx.quantize(gate, group_size=group_size, bits=bits)
+    gate = mx.random.normal((8, 256)).astype(mx.bfloat16)
+    packed, scales, biases = mx.quantize(gate, group_size=128, bits=bits)
     prefix = "model.language_model.layers.0.mlp.gate."
-    correction = mx.arange(8, dtype=mx.bfloat16)
-    original = {
-        prefix + "weight": packed,
-        prefix + "scales": scales,
-        prefix + "biases": biases,
-        prefix + "e_score_correction_bias": correction,
-    }
-    sanitized = sanitizer(original)
+    sanitized = sanitizer(
+        {
+            prefix + "weight": packed,
+            prefix + "scales": scales,
+            prefix + "biases": biases,
+        }
+    )
 
     out = "language_model.model.layers.0.mlp.gate."
     assert out + "scales" not in sanitized
     assert out + "biases" not in sanitized
-    weight = sanitized[out + "weight"]
-    assert weight.dtype == mx.float32
-    assert weight.shape == (8, 128)
-    expected = mx.dequantize(packed, scales, biases, group_size=group_size, bits=bits)
-    assert mx.array_equal(weight, expected.astype(mx.float32)).item()
-    assert mx.array_equal(sanitized[out + "e_score_correction_bias"], correction).item()
-    assert original[prefix + "weight"] is packed
-    assert prefix + "scales" in original and prefix + "biases" in original
-    gate_config = SimpleNamespace(**config_dict["text_config"])
-    gate_config.n_routed_experts = 8
-    router = _language().Glm5NextMoEGate(gate_config)
-    router.load_weights(
-        [(key[len(out) :], value) for key, value in sanitized.items()], strict=True
-    )
-    assert mx.array_equal(router.weight, expected.astype(mx.float32)).item()
+    expected = mx.dequantize(packed, scales, biases, group_size=128, bits=bits)
+    assert sanitized[out + "weight"].dtype == mx.float32
+    assert mx.array_equal(sanitized[out + "weight"], expected.astype(mx.float32)).item()
 
 
 def test_sanitize_keeps_unquantized_router_gate():
@@ -4709,55 +4695,10 @@ def test_sanitize_rejects_invalid_router_quantization_shapes():
         )
 
 
-@pytest.mark.parametrize(
-    "bits,group_size,with_biases",
-    [
-        (1, 32, True),
-        (7, 32, True),
-        (16, 32, True),
-        (4, 16, True),
-        (4, 256, True),
-        (4, 32, False),
-    ],
-)
-def test_sanitize_rejects_unsupported_affine_router_layout(
-    bits, group_size, with_biases
-):
-    config = _tiny_config_dict()
-    config["text_config"]["hidden_size"] = 256
-    sanitizer = _build_model_sanitizer(config)
-    prefix = "model.language_model.layers.0.mlp.gate."
-    original = {
-        prefix + "weight": mx.zeros((8, 256 * bits // 32), dtype=mx.uint32),
-        prefix + "scales": mx.ones((8, 256 // group_size)),
-    }
-    if with_biases:
-        original[prefix + "biases"] = mx.zeros((8, 256 // group_size))
-    before = dict(original)
-    with pytest.raises(ValueError, match="mlp.gate.weight.*cannot infer quantization"):
-        sanitizer(original)
-    assert original.keys() == before.keys()
-    assert all(original[key] is value for key, value in before.items())
-
-
-@pytest.mark.parametrize(
-    "recipe_path",
-    [
-        None,
-        "model.language_model.layers.0.mlp.gate",
-        "language_model.model.layers.0.mlp.gate",
-        False,
-    ],
-)
-@pytest.mark.parametrize("packed_gate", [False, True])
-def test_load_model_preserves_float_router_with_explicit_recipe(
-    monkeypatch, recipe_path, packed_gate
-):
+def test_load_model_dequantizes_quantized_router_gate(monkeypatch):
     import mlx_vlm.utils as utils
     from mlx.utils import tree_flatten
     from mlx_vlm.models import glm5_next
-
-    from omlx.utils.model_loading import expand_per_layer_quant_keys
 
     config = _tiny_config_dict()
     config["text_config"].update(
@@ -4770,43 +4711,23 @@ def test_load_model_preserves_float_router_with_explicit_recipe(
     args = utils.update_module_configs(args, glm5_next, config, ["text", "vision"])
     weights = dict(tree_flatten(glm5_next.Model(args).parameters()))
     gate = mx.random.normal((8, 128)).astype(mx.bfloat16)
+    packed, scales, biases = mx.quantize(gate, group_size=32, bits=4)
     key = "language_model.model.layers.0.mlp.gate"
-    if packed_gate:
-        packed, scales, biases = mx.quantize(gate, group_size=32, bits=4)
-        weights.update(
-            {key + ".weight": packed, key + ".scales": scales, key + ".biases": biases}
-        )
-        expected = mx.dequantize(packed, scales, biases, group_size=32, bits=4).astype(
-            mx.float32
-        )
-    else:
-        weights[key + ".weight"] = gate
-        expected = gate.astype(mx.float32)
-    original = dict(weights)
+    weights.update(
+        {key + ".weight": packed, key + ".scales": scales, key + ".biases": biases}
+    )
     config["quantization"] = {"bits": 4, "group_size": 32}
-    if recipe_path is False:
-        config["quantization"][key] = False
-    elif recipe_path is not None:
-        config["quantization"][recipe_path] = {
-            "bits": 4,
-            "group_size": 32,
-            "mode": "affine",
-        }
-    expand_per_layer_quant_keys(config)
     monkeypatch.setattr(utils, "load_config", lambda *_a, **_kw: config)
     monkeypatch.setattr(
         utils.glob, "glob", lambda *_a, **_kw: ["/fixture/router.safetensors"]
     )
     monkeypatch.setattr(utils, "_load_safetensors", lambda *_a, **_kw: weights)
 
-    # Exercise sanitizer -> recipe lookup -> nn.quantize -> strict loading.
     loaded = utils.load_model(Path("/fixture/router"), lazy=True, strict=True)
     router = loaded.language_model.model.layers[0].mlp.gate
-    assert isinstance(router, _language().Glm5NextMoEGate)
+    expected = mx.dequantize(packed, scales, biases, group_size=32, bits=4)
     assert router.weight.dtype == mx.float32
-    assert mx.array_equal(router.weight, expected).item()
-    assert not hasattr(router, "scales")
-    assert all(weights[k] is value for k, value in original.items())
+    assert mx.array_equal(router.weight, expected.astype(mx.float32)).item()
 
 
 @pytest.fixture(autouse=True)

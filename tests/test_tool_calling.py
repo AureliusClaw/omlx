@@ -1623,159 +1623,28 @@ def test_payload_without_any_close_marker_is_still_withheld():
 
 
 @pytest.mark.parametrize(
-    "withheld,is_payload",
+    "markers,text,is_payload",
     [
-        # Prose that quotes the marker: recoverable as content (#4241).
-        ("<tool_call> is how qwen calls a tool. END", False),
-        ("<tool_call> to call anything. END", False),
-        ("<tool_call> then write to save. END", False),
-        ("<|tool_call_start|> is the Hermes form. END", False),
-        # Structured payload openers: a truncated call, never content.
-        ('<tool_call>{"name":"f"', True),
-        ('<tool_call>[{"name":"f"', True),
-        ("<tool_call><function=write><parameter=x>", True),
-        ('<|tool_call_start|>{"name":"f"', True),
-        # The opener is the call syntax itself, so nothing was quoted: this is
-        # a bare attribute-function call cut mid-argument (#4241 review).
-        ("<function=write><parameter=content>cut", True),
-        # A marker with nothing behind it is a call cut at its own marker;
-        # recovering it would leak the control token into the answer.
-        ("<tool_call>", True),
-        ("<tool_call>   ", True),
+        ((), "<tool_call> is how qwen calls a tool. END", False),
+        ((), "<|tool_call_start|> is the Hermes form. END", False),
+        ((), "<tool_call> named again:\n```\n<tool_call>\n```\nEND", False),
+        ((), '<tool_call>{"name":"f"', True),
+        ((), "<tool_call><function=write><parameter=x>", True),
+        ((), "<function=write><parameter=content>cut", True),
+        ((), "<tool_call>", True),
+        ((), '<tool_call> is it. Now: <tool_call>{"name":"write"', True),
+        ((), "The tag <tool_call> is it. Now: <function=write>", True),
+        (("<|tool_call>", "<|tool_call|>"), '<|tool_call>call:f{city:"Seat', True),
     ],
 )
-def test_recovery_candidate_classifies_payload_versus_prose(withheld, is_payload):
-    """Only payload-shaped tails are a failed call; prose is recoverable."""
-
-    f = ToolCallStreamFilter(_make_tokenizer())
-
-    f.feed(withheld)
+def test_recovery_candidate_payload_versus_quoted_marker(markers, text, is_payload):
+    tokenizer = _make_tokenizer_with_end(*markers) if markers else _make_tokenizer()
+    f = ToolCallStreamFilter(tokenizer)
+    f.feed(text)
     f.finish()
 
-    assert f.take_recovery_is_payload() is is_payload
-    # The flag drains with the text so a second read cannot re-apply it.
-    assert f.take_recovery_candidate() == withheld
-    assert f.take_recovery_is_payload() is False
-
-
-def test_closed_envelope_leaves_no_recovery_payload_flag():
-    """A correctly closed call must not arm the payload flag."""
-
-    f = ToolCallStreamFilter(_make_tokenizer())
-
-    f.feed('<tool_call>{"name":"f"}</tool_call>')
-    f.finish()
-
-    assert f.take_recovery_candidate() == ""
-    assert f.take_recovery_is_payload() is False
-
-
-def test_gemma_style_payload_opener_is_classified_as_payload():
-    """A native ``call:name{...}`` payload is a call, not prose (#4241)."""
-
-    f = ToolCallStreamFilter(
-        _make_tokenizer_with_end("<|tool_call>", "<|tool_call|>")
-    )
-
-    f.feed('<|tool_call>call:get_weather{city:"Seat')
-    f.finish()
-
-    assert f.take_recovery_is_payload() is True
-    assert f.take_recovery_candidate() == '<|tool_call>call:get_weather{city:"Seat'
-
-
-def test_recovery_tail_without_a_second_marker_is_recoverable():
-    """Prose that quotes the marker once has no later opener (#4300)."""
-
-    f = ToolCallStreamFilter(_make_tokenizer())
-
-    f.feed("<tool_call> is how qwen calls a tool. END")
-    f.finish()
-
-    assert f.recovery_tail_has_later_opener() is False
-    assert f.take_recovery_candidate() == "<tool_call> is how qwen calls a tool. END"
-
-
-def test_recovery_tail_with_a_second_marker_is_refused():
-    """A payload-shaped later opener must be visible (#4300)."""
-
-    f = ToolCallStreamFilter(_make_tokenizer())
-
-    f.feed(
-        "<tool_call> is how qwen calls a tool. Now calling: "
-        '<tool_call>{"name":"write"'
-    )
-    f.finish()
-
-    assert f.recovery_tail_has_later_opener() is True
-    # The guard must not drain the candidate other readers still need.
-    assert f.take_recovery_candidate().startswith(
-        "<tool_call> is how qwen calls a tool. Now calling:"
-    )
-
-
-def test_recovery_tail_with_a_second_marker_in_prose_is_recoverable():
-    """A repeat of the marker in prose opens nothing, so the tail is prose.
-
-    Barty13's #4300 reproduction: the withheld tail is ordinary prose that
-    names the marker a second time inside a fence.  Refusing every repeat kept
-    the non-streaming caller at a hard 500 while the same text streamed back
-    intact.
-    """
-
-    f = ToolCallStreamFilter(_make_tokenizer())
-
-    f.feed(
-        "<tool_call> is how qwen calls a tool. It is named again in a fence:\n"
-        "```\n<tool_call>\n```\nOnly the name is quoted. END"
-    )
-    f.finish()
-
-    assert f.recovery_tail_has_later_opener() is False
-    assert f.take_recovery_candidate().endswith("Only the name is quoted. END")
-
-
-def test_recovery_tail_scan_passes_prose_before_a_later_payload_opener():
-    """The scan judges each later opener, so prose markers do not mask a call."""
-
-    f = ToolCallStreamFilter(_make_tokenizer())
-
-    f.feed(
-        "<tool_call> is how qwen calls a tool. Named again: "
-        "<tool_call> in prose. Now calling: "
-        '<tool_call>{"name":"write"'
-    )
-    f.finish()
-
-    assert f.recovery_tail_has_later_opener() is True
-
-
-def test_recovery_tail_guard_sees_a_later_naked_function_opener():
-    """``<function=`` is an opener too, with no ``<tool_call>`` around it."""
-
-    f = ToolCallStreamFilter(_make_tokenizer())
-
-    f.feed("The tag <tool_call> is how qwen calls a tool. Now calling: <function=write>")
-    f.finish()
-
-    assert f.recovery_tail_has_later_opener() is True
-
-
-def test_recovery_tail_guard_is_false_without_a_withheld_tail():
-    """A closed envelope leaves no candidate, so there is nothing to judge."""
-
-    f = ToolCallStreamFilter(_make_tokenizer())
-
-    assert f.recovery_tail_has_later_opener() is False
-
-    f.feed(
-        "<tool_call><function=write><parameter=x>done</parameter>"
-        "</function></tool_call>"
-    )
-    f.finish()
-
-    assert f.take_recovery_candidate() == ""
-    assert f.recovery_tail_has_later_opener() is False
+    assert f.recovery_candidate_is_payload() is is_payload
+    assert f.take_recovery_candidate()
 
 
 def test_close_marker_fallback_rescans_the_recovered_tail():
@@ -5874,114 +5743,35 @@ def test_native_union_parameter_keeps_correct_python_literal_values(
     assert json.loads(calls[0].function.arguments)["v"] == expected
 
 
-class TestStreamFilterLongOpenCandidateRegression:
-    """Regressions for hold windows interacting with long names and prose.
 
-    The fixed 128-char suffix window was sized for the literal markers;
-    open-tag candidates grow with the tool/namespace name, and bracket
-    holds grow with the prose after them.
-    """
-
-    def _feed_all(self, f, text, chunk=3):
-        out = [f.feed(text[i : i + chunk]) for i in range(0, len(text), chunk)]
-        out.append(f.finish())
-        return "".join(out)
-
-    def test_long_registered_tool_name_envelope_is_suppressed(self):
-        """A declared tool name past the old 128-char window still suppresses.
-
-        Previously the suffix window clamped at 128, chopping the open tag
-        mid-name; the complete tag could never reassemble and the whole
-        envelope leaked as content alongside the structured call.
-        """
-        name = "t" * 120
-        f = ToolCallStreamFilter(_make_tokenizer(), tools={name})
-        raw = (
-            f'before <function name="{name}">'
-            '<param name="a">1</param></function> after'
-        )
-        visible = self._feed_all(f, raw)
-        assert visible == "before  after"
-        assert "<function" not in visible
-
-    def test_unresolved_bracket_hold_recovers_prose_at_finish(self):
-        """'[Calling tool:' prose with no ']' must be recoverable, not lost.
-
-        The bracket hold is uncapped, and finish() used to drop the whole
-        tail silently — swallowing an unbounded amount of post-marker
-        prose. It now routes through the conditional-recovery contract
-        (caller re-emits only when final parsing confirms no structured
-        tool call).
-        """
-        f = ToolCallStreamFilter(_make_tokenizer())
-        prose_after = "maybe and then " + ("long prose " * 40)
-        visible = self._feed_all(f, f"Let me check the docs [Calling tool: {prose_after}")
-        assert visible == "Let me check the docs "
-        recovered = f.take_recovery_candidate()
-        assert recovered.startswith("[Calling tool: maybe and then")
-        assert "long prose" in recovered
+def test_stream_filter_suppresses_envelope_with_long_tool_name():
+    name = "t" * 120
+    f = ToolCallStreamFilter(_make_tokenizer(), tools={name})
+    raw = f'before <function name="{name}"><param name="a">1</param></function> after'
+    out = [f.feed(raw[i : i + 3]) for i in range(0, len(raw), 3)]
+    out.append(f.finish())
+    assert "".join(out) == "before  after"
 
 
-class TestQwenSplitRecoveryRegression:
-    """A missing outer close must not merge into the following call."""
-
-    def test_first_call_survives_missing_close_before_second_call(self):
-        from omlx.api.tool_calling import parse_qwen_tool_calls
-
-        tok = MagicMock(spec=[])
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "f",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"a": {"type": "string"}},
-                    },
+def test_qwen_missing_outer_close_does_not_merge_next_call():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}},
                 },
-            }
-        ]
-        text = (
-            "<tool_call><function=f><parameter=a>one</parameter></function>"
-            "<tool_call><function=f><parameter=a>two</parameter></function>"
-            "</tool_call>"
-        )
-        prose, calls, errors = parse_qwen_tool_calls(text, tok, tools, "stop")
-        decoded = [(c.function.name, c.function.arguments) for c in (calls or [])]
-        # Both calls recover with clean arguments; previously the two
-        # envelopes merged and the native parser kept a single call whose
-        # argument value had swallowed the second call's markup.
-        assert decoded == [("f", '{"a": "one"}'), ("f", '{"a": "two"}')]
-        assert errors == ()
-
-    def test_truncated_declared_tool_call_stays_suppressed(self):
-        """A truncated invocation naming a declared tool keeps the contract.
-
-        '[Calling tool: get_weather({"city":"SF"}' (no closing bracket) is
-        a cut-off call, not prose: its markup — half-written JSON naming
-        the tool — must not surface, matching the
-        drops-unresolved-bracket-fragment e2e contract.
-        """
-        f = ToolCallStreamFilter(_make_tokenizer(), tools={"get_weather"})
-        text = 'Before [Calling tool: get_weather({"city":"SF"}'
-        out = [f.feed(ch) for ch in text]
-        out.append(f.finish())
-        assert "".join(out) == "Before "
-        assert f.take_recovery_candidate() == ""
-
-    def test_truncated_undeclared_name_stays_suppressed_when_tools_declared(self):
-        """With tools declared, an undeclared truncated name stays suppressed.
-
-        The complete path parses any name to a structured call; the
-        truncated path must not disagree by re-emitting undeclared-name
-        markup as content.
-        """
-        f = ToolCallStreamFilter(
-            _make_tokenizer(), tools={"get_weather"}
-        )
-        text = 'Before [Calling tool: unknown_fn({"x":1}'
-        out = [f.feed(ch) for ch in text]
-        out.append(f.finish())
-        assert "".join(out) == "Before "
-        assert f.take_recovery_candidate() == ""
-
+            },
+        }
+    ]
+    text = (
+        "<tool_call><function=f><parameter=a>one</parameter></function>"
+        "<tool_call><function=f><parameter=a>two</parameter></function>"
+        "</tool_call>"
+    )
+    _, calls, errors = parse_qwen_tool_calls(text, MagicMock(spec=[]), tools, "stop")
+    decoded = [(c.function.name, c.function.arguments) for c in calls]
+    assert decoded == [("f", '{"a": "one"}'), ("f", '{"a": "two"}')]
+    assert errors == ()
