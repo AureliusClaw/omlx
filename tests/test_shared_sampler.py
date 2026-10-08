@@ -9,11 +9,13 @@ row exactly as a one-row call would. CPU only.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import mlx.core as mx
+import pytest
 
-from types import SimpleNamespace  # noqa: E402
-
-import pytest  # noqa: E402
+from omlx.request import SamplingParams
+from omlx.utils import sampling
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -24,9 +26,6 @@ def _cpu_device():
     mx.set_default_device(mx.cpu)
     yield
     mx.set_default_device(previous)
-
-from omlx.request import SamplingParams  # noqa: E402
-from omlx.utils import sampling  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -47,19 +46,28 @@ def test_different_parameters_get_different_samplers():
     assert sampling.make_shared_sampler(temp=0.6, top_p=0.95, top_k=20) is not a
     assert sampling.make_shared_sampler(temp=0.7, top_p=0.9, top_k=20) is not a
     assert sampling.make_shared_sampler(temp=0.7, top_p=0.95, top_k=40) is not a
-    assert sampling.make_shared_sampler(temp=0.7, top_p=0.95, top_k=20, min_p=0.05) is not a
-    assert sampling.make_shared_sampler(temp=0.0) is sampling.make_shared_sampler(temp=0.0)
+    assert (
+        sampling.make_shared_sampler(temp=0.7, top_p=0.95, top_k=20, min_p=0.05)
+        is not a
+    )
+    assert sampling.make_shared_sampler(temp=0.0) is sampling.make_shared_sampler(
+        temp=0.0
+    )
 
 
 def test_xtc_is_never_shared():
     kwargs = dict(temp=1.0, xtc_probability=0.5, xtc_threshold=0.1)
-    assert sampling.make_shared_sampler(**kwargs) is not sampling.make_shared_sampler(**kwargs)
+    assert sampling.make_shared_sampler(**kwargs) is not sampling.make_shared_sampler(
+        **kwargs
+    )
 
 
 def test_opt_out_builds_one_sampler_per_call(monkeypatch):
     monkeypatch.setattr(sampling, "_SHARED_SAMPLERS_ENABLED", False)
     kwargs = dict(temp=0.7, top_p=0.95, top_k=20)
-    assert sampling.make_shared_sampler(**kwargs) is not sampling.make_shared_sampler(**kwargs)
+    assert sampling.make_shared_sampler(**kwargs) is not sampling.make_shared_sampler(
+        **kwargs
+    )
 
 
 def test_cache_is_bounded(monkeypatch):
@@ -74,7 +82,14 @@ def _logprobs(rows: int, vocab: int = 128 * 80, seed: int = 0) -> mx.array:
     return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
 
-@pytest.mark.parametrize("kwargs", [dict(temp=0.7, top_p=0.95, top_k=20), dict(temp=0.7, top_p=0.9), dict(temp=0.7, min_p=0.05, top_k=50)])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(temp=0.7, top_p=0.95, top_k=20),
+        dict(temp=0.7, top_p=0.9),
+        dict(temp=0.7, min_p=0.05, top_k=50),
+    ],
+)
 def test_batched_filter_matches_one_row_calls(kwargs):
     sampler = sampling.make_shared_sampler(**kwargs)
     logprobs = _logprobs(8)

@@ -278,7 +278,7 @@ def make_sampler(
 # OMLX_SHARED_SAMPLERS=0 builds one sampler per request again.
 _SHARED_SAMPLERS_ENABLED = os.environ.get("OMLX_SHARED_SAMPLERS", "1") != "0"
 _SHARED_SAMPLERS_MAX = 256
-_shared_samplers: "OrderedDict[tuple, Callable[[mx.array], mx.array]]" = OrderedDict()
+_shared_samplers: OrderedDict[tuple, Callable[[mx.array], mx.array]] = OrderedDict()
 _shared_samplers_lock = threading.Lock()
 
 
