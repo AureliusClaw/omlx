@@ -205,7 +205,7 @@ class ServerSettings:
     max_audio_upload_size: str = "100MB"
     # Maximum raw image payload size accepted ("50MB", "100MB").
     max_image_upload_size: str = "50MB"
-    # Cap on any request body.
+    # Cap on any request body. It never drops below the upload limits.
     max_request_body_size: str = "512MB"
     # Maximum side length in pixels for VLM input images (0 to disable downscaling).
     max_image_side_length: int = 2048
@@ -1698,6 +1698,12 @@ class GlobalSettings:
                 errors.append("max_image_upload_size must be positive")
         except (AttributeError, TypeError, ValueError) as e:
             errors.append(f"Invalid max_image_upload_size: {e}")
+
+        try:
+            if parse_size(self.server.max_request_body_size) <= 0:
+                errors.append("max_request_body_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid max_request_body_size: {e}")
 
         if self.server.max_image_side_length < 0:
             errors.append("max_image_side_length must be non-negative")

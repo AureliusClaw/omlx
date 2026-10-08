@@ -10,6 +10,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+import omlx.api.body_limit as body_limit
 import omlx.server as srv
 from omlx.api.body_limit import RequestBodySizeLimitMiddleware
 from omlx.engine.decision import DecisionEngine
@@ -1299,3 +1300,8 @@ class TestRequestBodySizeLimit:
         asyncio.run(middleware(scope, receive, None))
         assert seen == [40]  # The chunk that crosses the limit is dropped.
 
+    def test_limit_follows_raised_upload_limits(self, monkeypatch):
+        settings = GlobalSettings()
+        settings.server.max_audio_upload_size = "1GB"
+        monkeypatch.setattr(body_limit, "get_settings", lambda: settings)
+        assert body_limit._resolve_limit() > 1024**3

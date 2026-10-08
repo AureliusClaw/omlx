@@ -21,9 +21,20 @@ DEFAULT_MAX_REQUEST_BODY_BYTES = 512 * 1024 * 1024
 
 
 def _resolve_limit() -> int:
-    """Read the configured limit; fall back to the default when unset."""
+    """Return the body cap, never below the upload limits users can raise."""
     try:
-        return get_settings().server.max_request_body_bytes()
+        settings = get_settings()
+        server = settings.server
+        integrations = settings.integrations
+        uploads = max(
+            server.max_audio_upload_bytes(),
+            server.max_image_upload_bytes(),
+            integrations.markitdown_max_file_size_mb
+            * integrations.markitdown_max_files_per_request
+            * 1024**2,
+        )
+        # Uploads can arrive as base64, which adds a third.
+        return max(server.max_request_body_bytes(), uploads * 4 // 3 + 1024**2)
     except (RuntimeError, AttributeError, TypeError, ValueError):
         return DEFAULT_MAX_REQUEST_BODY_BYTES
 
