@@ -1192,7 +1192,7 @@
   "modal.model_settings.qwen_ane_tune_test": "测试",
   "modal.model_settings.qwen_ane_tune_throughput": "提示词 tok/s",
   "modal.model_settings.qwen_oq_a8": "Qwen INT8 激活预填充",
-  "modal.model_settings.qwen_oq_a8_hint": "为支持的 Q4/Q5 预填充运算启用实验性 GPU INT8 激活量化。需要 M5 系列或更新芯片及原生内核。输出和模型质量可能变化；部分量化格式无法加速。不能与 ANE 预填充同时使用。重新加载模型后生效。",
+  "modal.model_settings.qwen_oq_a8_hint": "为支持的 Q4/Q5/Q8 预填充运算启用实验性 GPU INT8 激活量化。需要 M5 系列或更新芯片及原生内核。输出和模型质量可能变化；部分量化格式无法加速。不能与 ANE 预填充同时使用。重新加载模型后生效。",
   "modal.model_settings.qwen_oq_a8_min_tokens": "最少提示词 Token",
   "modal.model_settings.moe_expert_offload": "MoE 专家卸载",
   "modal.model_settings.moe_expert_offload_hint": "按需从检查点流式加载混合专家（MoE）权重，仅保留一小部分常驻。可容纳大于内存的 MoE 模型；代价是解码速度。需要重新加载。",

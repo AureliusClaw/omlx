@@ -1192,7 +1192,7 @@
   "modal.model_settings.qwen_ane_tune_test": "Test",
   "modal.model_settings.qwen_ane_tune_throughput": "Prompt tok/s",
   "modal.model_settings.qwen_oq_a8": "Qwen INT8 Activation Prefill",
-  "modal.model_settings.qwen_oq_a8_hint": "為支援的Q4/Q5預填充運算啟用實驗性GPU INT8啟用值量化。需要M5系列或更新晶片及原生核心。輸出和模型品質可能改變；部分量化格式無法加速。不能與ANE預填充同時使用。重新載入模型後生效。",
+  "modal.model_settings.qwen_oq_a8_hint": "為支援的Q4/Q5/Q8預填充運算啟用實驗性GPU INT8啟用值量化。需要M5系列或更新晶片及原生核心。輸出和模型品質可能改變；部分量化格式無法加速。不能與ANE預填充同時使用。重新載入模型後生效。",
   "modal.model_settings.qwen_oq_a8_min_tokens": "Minimum prompt tokens",
   "modal.model_settings.moe_expert_offload": "MoE Expert Offload",
   "modal.model_settings.moe_expert_offload_hint": "Stream Mixture-of-Experts weights from the checkpoint on demand, keeping only a fraction resident. Fits MoE models larger than memory; costs decode speed. Requires reload.",

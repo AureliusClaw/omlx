@@ -1192,7 +1192,7 @@
   "modal.model_settings.qwen_ane_tune_test": "Test",
   "modal.model_settings.qwen_ane_tune_throughput": "Prompt tok/s",
   "modal.model_settings.qwen_oq_a8": "Qwen INT8 Activation Prefill",
-  "modal.model_settings.qwen_oq_a8_hint": "対応するQ4/Q5プリフィル演算にGPU INT8活性値量子化を適用する実験的機能です。M5シリーズ以降とネイティブカーネルが必要です。出力やモデルの品質が変わる可能性があり、一部の量子化形式では高速化されません。ANEプリフィルとは併用できません。モデルの再読み込み後に適用されます。",
+  "modal.model_settings.qwen_oq_a8_hint": "対応するQ4/Q5/Q8プリフィル演算にGPU INT8活性値量子化を適用する実験的機能です。M5シリーズ以降とネイティブカーネルが必要です。出力やモデルの品質が変わる可能性があり、一部の量子化形式では高速化されません。ANEプリフィルとは併用できません。モデルの再読み込み後に適用されます。",
   "modal.model_settings.qwen_oq_a8_min_tokens": "Minimum prompt tokens",
   "modal.model_settings.moe_expert_offload": "MoE Expert Offload",
   "modal.model_settings.moe_expert_offload_hint": "Stream Mixture-of-Experts weights from the checkpoint on demand, keeping only a fraction resident. Fits MoE models larger than memory; costs decode speed. Requires reload.",

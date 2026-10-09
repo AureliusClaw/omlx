@@ -1192,7 +1192,7 @@
   "modal.model_settings.qwen_ane_tune_test": "Test",
   "modal.model_settings.qwen_ane_tune_throughput": "Prompt tok/s",
   "modal.model_settings.qwen_oq_a8": "Qwen INT8 Activation Prefill",
-  "modal.model_settings.qwen_oq_a8_hint": "Экспериментальное квантование активаций INT8 на GPU для поддерживаемых операций префилла Q4/Q5. Требуются чип M5 или новее и нативные ядра. Ответы и качество модели могут измениться; некоторые форматы не ускоряются. Нельзя использовать вместе с префиллом ANE. Применяется после перезагрузки модели.",
+  "modal.model_settings.qwen_oq_a8_hint": "Экспериментальное квантование активаций INT8 на GPU для поддерживаемых операций префилла Q4/Q5/Q8. Требуются чип M5 или новее и нативные ядра. Ответы и качество модели могут измениться; некоторые форматы не ускоряются. Нельзя использовать вместе с префиллом ANE. Применяется после перезагрузки модели.",
   "modal.model_settings.qwen_oq_a8_min_tokens": "Minimum prompt tokens",
   "modal.model_settings.moe_expert_offload": "MoE Expert Offload",
   "modal.model_settings.moe_expert_offload_hint": "Stream Mixture-of-Experts weights from the checkpoint on demand, keeping only a fraction resident. Fits MoE models larger than memory; costs decode speed. Requires reload.",
