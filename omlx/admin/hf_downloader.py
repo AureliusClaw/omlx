@@ -10,6 +10,7 @@ settings.json so a restart resumes interrupted downloads.
 import asyncio
 import enum
 import errno
+import functools
 import json
 import logging
 import os
@@ -56,6 +57,10 @@ _STARTUP_STALL_TIMEOUT = 120
 
 _PROGRESS_POLL_INTERVAL = 0.5
 _SUBPROCESS_TERMINATE_TIMEOUT = 5
+
+# Seconds between aborts while reaping a cancelled download whose worker
+# thread is still transferring.
+_REAP_INTERVAL = 0.5
 
 # Seconds of byte-count history the reported speed averages over.
 _SPEED_WINDOW = 1.0
@@ -1274,6 +1279,35 @@ class HFDownloader(_QueuePersistenceMixin):
         logger.info(f"Download cancelled: {task.repo_id} (task_id={task_id})")
         return True
 
+    async def cancel_download_for_dir(self, target_dir: Path) -> bool:
+        """Cancel the running download that writes into ``target_dir``.
+
+        Called before the dashboard removes a model directory: the worker
+        thread would otherwise keep downloading into the tree being deleted.
+        Returns only once that thread has stopped writing.
+
+        Args:
+            target_dir: Directory the download writes to.
+
+        Returns:
+            True if a running task for that directory was cancelled.
+        """
+        resolved = Path(target_dir).resolve()
+        for task in list(self._tasks.values()):
+            if task.status not in (
+                DownloadStatus.PENDING,
+                DownloadStatus.DOWNLOADING,
+            ):
+                continue
+            if (self._model_dir / task.repo_id).resolve() == resolved:
+                active = self._active_tasks.get(task.task_id)
+                if not await self.cancel_download(task.task_id):
+                    return False
+                if active is not None:
+                    await asyncio.gather(active, return_exceptions=True)
+                return True
+        return False
+
     def remove_task(self, task_id: str) -> bool:
         """Remove a completed, failed, or cancelled task from the list.
 
@@ -1370,6 +1404,22 @@ class HFDownloader(_QueuePersistenceMixin):
         abort_xet_session()
 
         logger.info("HF Downloader shut down")
+
+    async def _reap_payload(self, payload: asyncio.Future) -> None:
+        """Abort the xet session until the abandoned download call returns.
+
+        A single abort only cancels the transfers already in flight: the hub
+        builds a fresh session for the next file it starts (``get_xet_session``
+        recreates the one the abort dropped), so the transfer carries on after
+        the task row already reads "cancelled". Abort again until the call the
+        task abandoned has returned -- that return is the only proof its writer
+        stopped. The download semaphore is still held here, so a queued task
+        cannot be the one being aborted.
+        """
+        while not payload.done():
+            await asyncio.sleep(_REAP_INTERVAL)
+            abort_xet_session()
+        await asyncio.gather(payload, return_exceptions=True)
 
     async def _run_download(self, task_id: str, hf_token: str) -> None:
         """Execute a download task.
@@ -1479,19 +1529,28 @@ class HFDownloader(_QueuePersistenceMixin):
                     self._poll_progress(task_id, target_dir, wire_counter)
                 )
 
-                xet_error: Exception | None = None
-                try:
-                    # Awaiting the thread here is intentional: after a stall,
-                    # fallback cannot start until abort_xet_session() has made
-                    # the original writer return.
-                    await asyncio.to_thread(
+                payload = asyncio.get_running_loop().run_in_executor(
+                    None,
+                    functools.partial(
                         snapshot_download,
                         **dl_kwargs,
                         tqdm_class=_make_cancellable_tqdm(
                             lambda: task_id in self._cancelled,
                             on_wire_bytes=wire_counter.add,
                         ),
-                    )
+                    ),
+                )
+                xet_error: Exception | None = None
+                try:
+                    # Awaiting the worker is intentional: the HTTP fallback
+                    # must not start while the xet writer is still filling the
+                    # same files. Shielded so a cancel leaves the worker where
+                    # _reap_payload can watch it unwind, instead of detaching
+                    # it: a thread cannot be interrupted from here.
+                    await asyncio.shield(payload)
+                except asyncio.CancelledError:
+                    await self._reap_payload(payload)
+                    raise
                 except Exception as error:
                     stalled = self._stalled.pop(task_id, None)
                     if stalled is not None:
@@ -1804,13 +1863,18 @@ class HFDownloader(_QueuePersistenceMixin):
         return total
 
     def _cleanup_partial(self, task: DownloadTask) -> None:
-        """Remove in-progress shards while keeping finalized files for resume.
+        """Remove in-progress files while keeping finalized files for resume.
 
-        Hub stages partial downloads inside a hidden ``._____temp`` directory
-        and only renames a shard into the target on completion. Wiping the
-        whole target dir would also nuke shards the user has already paid
-        for; finalized files are visible in the file browser, so users can
-        keep them for auto-resume on retry or remove them themselves.
+        Hub 1.x stages an unfinished file inside
+        ``<target>/.cache/huggingface/download`` as
+        ``<name>.<hash>.<etag>.incomplete`` and renames it into place only
+        when the transfer completes; the hidden ``._____temp`` directory is
+        the layout hub 0.x used. ``.metadata`` files in that staging tree
+        stay: they are what lets the next attempt skip files it already
+        verified. Wiping the whole target dir would also nuke shards the user
+        has already paid for; finalized files are visible in the file
+        browser, so users can keep them for auto-resume on retry or remove
+        them themselves.
         """
         target_dir = self._model_dir / task.repo_id
         temp_dir = target_dir / "._____temp"
@@ -1820,3 +1884,18 @@ class HFDownloader(_QueuePersistenceMixin):
                 logger.info(f"Cleaned up in-progress shards: {temp_dir}")
             except Exception as e:
                 logger.error(f"Failed to clean up {temp_dir}: {e}")
+
+        staging_dir = target_dir / ".cache" / "huggingface" / "download"
+        if not staging_dir.is_dir():
+            return
+        partials = list(staging_dir.rglob("*.incomplete"))
+        for partial in partials:
+            try:
+                partial.unlink()
+            except OSError as e:
+                logger.error(f"Failed to clean up {partial}: {e}")
+        if partials:
+            logger.info(
+                f"Cleaned up {len(partials)} in-progress file(s): "
+                f"{staging_dir}"
+            )
