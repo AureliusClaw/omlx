@@ -18,7 +18,6 @@ from ..deepseek_v4.hyper_connection import hc_expand as _hc_expand
 from ..fast_ops import exact_hc_norm
 from ..linear import DECODE_BLOCK_SIZE
 from mlx_lm.models.mla import MultiLinear
-from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches import glm53_kda_prework
 from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as _decode_kernels
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU, _sort_threshold
@@ -65,8 +64,8 @@ def _cache_parts(cache):
 # Single-sequence decode (L == 1) and short verify blocks (L <= 8, the
 # DECODE_BLOCK_SIZE of the shared HC helpers) run fused kernels that
 # reproduce the reference op graph bit for bit; see decode_kernels.py.
-# They are validated on M5 (NAX) GPUs and used there.
-_DECODE_FUSION = is_nax_available()
+# They run on M3 and newer GPUs (decode_kernels.fused_decode_supported).
+_DECODE_FUSION = _decode_kernels.fused_decode_supported()
 _DECODE_BLOCK = 8
 
 # One-token decode forwards start evaluating every this many layers.
