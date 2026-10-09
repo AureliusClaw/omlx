@@ -7877,8 +7877,7 @@ async def delete_hf_model(
     if not model_path.is_dir():
         raise HTTPException(status_code=400, detail="Not a model directory")
 
-    # A download still writing into this tree would keep recreating it, so
-    # stop it before the directory goes away (#4347).
+    # A download still writing here would recreate the tree.
     if _hf_downloader is not None:
         await _hf_downloader.cancel_download_for_dir(model_path)
 
