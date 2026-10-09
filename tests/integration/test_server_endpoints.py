@@ -2874,6 +2874,30 @@ def test_structured_output_preserves_unicode(
         assert all(value in content for value in ["име", *expected.values()])
 
 
+@pytest.mark.parametrize("api", ["chat/completions", "responses"])
+def test_structured_output_keeps_lone_surrogate_escape(client, mock_llm_engine, api):
+    # json.loads accepts an unpaired surrogate escape, but the decoded
+    # character cannot be encoded as UTF-8.
+    model_text = '{"text": "x\\ud83dy"}'
+    mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(text=model_text))
+    if api == "chat/completions":
+        body = {
+            "messages": [{"role": "user", "content": "Return JSON"}],
+            "response_format": {"type": "json_object"},
+        }
+    else:
+        body = {"input": "Return JSON", "text": {"format": {"type": "json_object"}}}
+
+    response = client.post(f"/v1/{api}", json={"model": "test-model", **body})
+
+    assert response.status_code == 200
+    if api == "chat/completions":
+        content = response.json()["choices"][0]["message"]["content"]
+    else:
+        content = response.json()["output"][0]["content"][0]["text"]
+    assert content == model_text
+
+
 @pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
 def test_nonstream_thinking_length_channels(client, mock_llm_engine, api):
     mock_llm_engine.chat = AsyncMock(
