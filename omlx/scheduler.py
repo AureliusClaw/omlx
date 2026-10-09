@@ -4136,6 +4136,7 @@ class Scheduler:
                     if existing_cache is None:
                         request.prompt_cache = prompt_cache
                     request.cached_tokens += processed_tokens
+                    request.prefill_resumed_tokens += processed_tokens
                     request.remaining_tokens = tokens[processed_tokens:]
                 # Admission already passed. A resumed run can pause again
                 # before its first chunk and must not be re-admitted.
@@ -10053,6 +10054,7 @@ class Scheduler:
                             request.prompt_cache = None
                             request.block_table = None
                             request.cached_tokens = 0
+                            request.prefill_resumed_tokens = 0
                             request.shared_prefix_blocks = 0
                             request.remaining_tokens = request.prompt_token_ids
                             logger.debug(
@@ -10082,6 +10084,7 @@ class Scheduler:
                             request.prompt_cache = None
                             request.block_table = None
                             request.cached_tokens = 0
+                            request.prefill_resumed_tokens = 0
                             request.shared_prefix_blocks = 0
                             request.remaining_tokens = request.prompt_token_ids
                             logger.debug(
@@ -12135,6 +12138,7 @@ class Scheduler:
                 cache_to_use = None
                 request.prompt_cache = None
                 request.cached_tokens = 0
+                request.prefill_resumed_tokens = 0
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
                 # Indices were scored against the rejected cache's cached_tokens.
@@ -12407,6 +12411,7 @@ class Scheduler:
                         cache_to_use = None
                         request.prompt_cache = None
                         request.cached_tokens = 0
+                        request.prefill_resumed_tokens = 0
                         request.remaining_tokens = request.prompt_token_ids
                         tokens_to_process = request.prompt_token_ids
                     # Fall through to normal prefill
@@ -12917,7 +12922,9 @@ class Scheduler:
                 completion_tokens=request.num_output_tokens,
                 generated_at=output_generated_at,
                 generated_until=output_generated_at,
-                cached_tokens=request.cached_tokens,
+                cached_tokens=max(
+                    0, request.cached_tokens - request.prefill_resumed_tokens
+                ),
                 benchmark_prefill_chunks=(
                     list(getattr(request, "benchmark_prefill_chunks", []))
                     if getattr(request, "benchmark_trace", False)
@@ -13697,6 +13704,7 @@ class Scheduler:
         request.batch_uid = None
         request.prompt_cache = None
         request.cached_tokens = 0
+        request.prefill_resumed_tokens = 0
         request.remaining_tokens = request.prompt_token_ids
         request.block_table = None
         request.shared_prefix_blocks = 0
@@ -13970,6 +13978,7 @@ class Scheduler:
         request.batch_uid = None
         request.prompt_cache = None
         request.cached_tokens = 0
+        request.prefill_resumed_tokens = 0
         request.remaining_tokens = request.prompt_token_ids
         request.block_table = None
         request.shared_prefix_blocks = 0
