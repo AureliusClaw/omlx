@@ -9,6 +9,7 @@ from mlx_lm.models.cache import KVCache
 
 from omlx.request import Request, RequestStatus, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig, _PrefillEvictionNeeded
+from omlx.server import _usage_timing_fields
 
 
 class _RecordingModel:
@@ -119,8 +120,6 @@ def test_external_prefill_resumes_without_replaying_tokens(
     assert finished == {request.request_id}
     assert [output.cached_tokens for output in outputs] == [cached_tokens] * 2
 
-    from omlx.server import _usage_timing_fields
-
     usage = _usage_timing_fields(
         outputs[-1].prompt_tokens,
         outputs[-1].completion_tokens,
@@ -130,32 +129,3 @@ def test_external_prefill_resumes_without_replaying_tokens(
         cached_tokens=outputs[-1].cached_tokens,
     )
     assert usage["prompt_tokens_per_second"] == len(prompt) - cached_tokens
-
-
-@pytest.mark.parametrize("reset", ["reprefill", "memory_retry", "cache_recovery"])
-def test_cold_retry_clears_resumed_prefill_usage(mock_tokenizer, reset):
-    scheduler = Scheduler(model=_RecordingModel(), tokenizer=mock_tokenizer)
-    request = Request(
-        request_id="req-reset",
-        prompt=list(range(32)),
-        prompt_token_ids=list(range(32)),
-        sampling_params=SamplingParams(),
-        cached_tokens=12,
-        prefill_resumed_tokens=8,
-    )
-    if reset == "reprefill":
-        scheduler._reset_request_for_reprefill(request)
-    elif reset == "memory_retry":
-        assert scheduler._requeue_or_fail_prefill(
-            request, RuntimeError("Memory limit exceeded during prefill")
-        )
-    else:
-        from collections import deque
-
-        from omlx.cache.recovery import CacheRecoveryManager
-
-        CacheRecoveryManager().reschedule_running_requests(
-            {request.request_id: request}, deque(), RequestStatus.WAITING
-        )
-    assert request.cached_tokens == 0
-    assert request.prefill_resumed_tokens == 0

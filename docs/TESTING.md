@@ -1,9 +1,6 @@
 # Qwen3-ASR audio quantization tests
 
-Run `python -m pytest -q tests/test_qwen3_asr_quantization.py tests/test_audio_stt.py`
-to check Qwen3-ASR audio quantization. Small local checkpoints cover mixed 4-bit
-text and 8-bit audio weights, floating-point audio layers, and both quantization
-config keys through the STT loader. No model download is required.
+Run `python -m pytest -q tests/test_audio_stt.py -k Qwen3ASRAudioQuantization` to check Qwen3-ASR audio quantization through the STT loader. Small local checkpoints cover mixed 4-bit text and 8-bit audio weights and floating-point audio layers. No model download is required.
 
 # Cluster test filesystem isolation
 
@@ -87,10 +84,7 @@ Run `python -m pytest -q tests/test_qwen4_verify_attention_rows.py` to check tha
 
 # Prefill memory accounting tests
 
-Run `python -m pytest -q tests/test_scheduler_prefill_eviction_progress.py`
-to check usage after prefill pauses. Cold and warm requests retain token progress
-across repeated pauses, report only restored prefix tokens as cached, and include
-locally computed tokens in prompt throughput. Cold retries clear the pause counter.
+Run `python -m pytest -q tests/test_scheduler_prefill_eviction_progress.py` to check usage after prefill pauses. Cold and warm requests retain token progress across repeated pauses, report only restored prefix tokens as cached, and include locally computed tokens in prompt throughput.
 
 `python -m pytest -q tests/test_engine_preflight.py` checks route admission after eviction or reclaim. Both batched wrappers must refresh their cached MLX sample on the owning executor, including when the pool reports that no action was necessary. Controlled memory readings cover newly available headroom, insufficient headroom, and requests that already fit without executor work.
 

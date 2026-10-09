@@ -4375,17 +4375,10 @@ class TestMemorySettleBarrier:
     async def test_unload_survives_metal_command_buffer_error(
         self, pool_with_loaded_model
     ):
-        """#3737/#4344: a Metal-OOM prefill leaves a pending command-buffer
-        error that mx.synchronize() re-raises during teardown. The first raise
-        consumes that pending error, so the synchronize/clear_cache retry
-        succeeds: no exception escapes the unload and memory accounting is
-        still released, instead of leaking so every later load 507s.
-        """
+        """A pending Metal error at unload must not leak the memory accounting."""
         pool = pool_with_loaded_model
         est_size = pool._entries["model-a"].estimated_size  # 5GB
         initial_memory = pool._current_model_memory
-
-        # First synchronize raises the pending OOM error; the retry succeeds.
         oom_error = RuntimeError(
             "[METAL] Command buffer execution failed: Insufficient Memory "
             "(00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
@@ -4397,31 +4390,20 @@ class TestMemorySettleBarrier:
             patch("omlx.engine_pool.get_phys_footprint", return_value=0),
             patch("asyncio.sleep", new_callable=AsyncMock),
         ):
-            # Pre-unload 10GB -> 5GB after unload (5GB freed >= 3GB tolerance).
             mock_mx.get_active_memory = MagicMock(
                 side_effect=[10 * 1024**3, 5 * 1024**3]
             )
-            # First synchronize raises the pending OOM error; the retry
-            # (side_effect exhausted) returns a sentinel and succeeds.
             mock_mx.synchronize = MagicMock(side_effect=[oom_error, None])
             mock_mx.clear_cache = MagicMock()
 
-            # (a) No exception escapes the unload.
             await pool._unload_engine("model-a")
 
-        # (b) Memory accounting was released by the resident size.
         assert pool._entries["model-a"].engine is None
         assert pool._current_model_memory == initial_memory - est_size
 
     @pytest.mark.asyncio
-    async def test_unload_exits_on_submissions_ignored(
-        self, pool_with_loaded_model
-    ):
-        """#3737/#4344: a fatal 'GPU submissions ignored' Metal error must
-        still exit the process even during teardown: exit_if_gpu_submissions_ignored
-        is honoured (fatal_exit called) before any retry, so the process is
-        terminated rather than leaving memory accounting leaked.
-        """
+    async def test_unload_exits_on_submissions_ignored(self, pool_with_loaded_model):
+        """SubmissionsIgnored at unload exits instead of retrying."""
         pool = pool_with_loaded_model
         sub_ignored = RuntimeError(
             "[METAL] Command buffer execution failed: GPU submissions ignored "
@@ -4439,11 +4421,9 @@ class TestMemorySettleBarrier:
             mock_mx.synchronize = MagicMock(side_effect=[sub_ignored])
             mock_mx.clear_cache = MagicMock()
 
-            # exit_if_gpu_submissions_ignored() calls fatal_exit() which raises.
             with pytest.raises(SystemExit):
                 await pool._stop_and_unload_engine("model-a")
 
-        # The fatal-exit hook was invoked with the error before any retry.
         fatal_exit.assert_called_once()
         assert str(sub_ignored) in str(fatal_exit.call_args.args[0])
 
