@@ -181,6 +181,33 @@ Deactivation prevents future distributed loads. An already-loaded engine
 continues until the normal unload lifecycle so an admin click cannot interrupt
 an in-flight request.
 
+## Adding a discovered Mac to an existing cluster
+
+1. On the coordinator, open **Cluster > Add Mac**. Choose **Add this Mac** on the discovered Mac’s row.
+2. On that new Mac, open oMLX > Cluster. Select the coordinator and choose **Show code**. If discovery is unavailable, use **Add by IP** with the coordinator address shown in the membership panel.
+3. The coordinator keeps the selected Mac’s pairing form open while waiting for its request. Once the request arrives, enter the six-digit code shown on the new Mac and approve it. A request from another Mac does not enable this form.
+4. After pairing, the new Mac appears as a candidate. Preview the new model split, review it, and explicitly apply it. Pairing alone does not change or reload the active model.
+
+Discovery is not authorization: the existing code-based pairing and placement approval remain required. Invalid or expired codes show an error in the selected form; retry or cancel there. Adding a member still uses the existing model staging, compatibility checks and protected deployment reload path.
+
+## Forgetting an offline Mac or cluster
+
+Each paired Mac in the active cluster list has a **Forget this Mac** action. It removes that Mac’s local pairing without contacting it. Model placements containing that Mac are removed after verified local teardown because a signed layer/rank assignment cannot remain valid after losing a member. Other Macs remain paired; create a new model placement with the remaining Macs.
+
+The local Mac has a **Leave cluster** action. **Forget entire cluster** performs the same local departure: remove all saved placements and all local peer pairings. Neither action changes configuration on unreachable Macs. Each action requires its own confirmation.
+
+Active requests and failed local process teardown block removal. Remote shutdown is explicitly unverified. SSH trust removal reuses the existing local pairing revocation path. Normal **Remove cluster setup** retains verified cluster-wide shutdown and does not remove pairings.
+
+## Pending pairing cleanup
+
+Cancelling a join clears the local attempt immediately. If the coordinator has not acknowledged withdrawal, the dashboard keeps a cleanup warning and retries while the tab is visible. The saved cancellation proof survives restart; a new attempt to the same coordinator waits for cleanup, while other coordinators remain usable.
+
+The current coordinator returns success when a pending request is already absent. For the older response reported in #3623, HTTP 404 is accepted only when its JSON body explicitly says `{"detail": "no pending join request"}`. This clears the saved withdrawal and permits a fresh attempt to that coordinator.
+
+A generic 404, missing endpoint, invalid/oversized response, connection failure or server error does not prove cleanup. Those cases retain the warning and cancellation proof. This change does not make an unreachable coordinator acknowledge withdrawal and does not remove existing paired devices or model deployments.
+
+To abandon an old cleanup locally, select **Forget this cleanup**, then **Confirm forget** in the warning. This permanently removes saved withdrawal records on this Mac, including after restart, without contacting the other Mac. The other Mac may retain the old request. Current pairing, an active join and model deployments stay unchanged. A later cancellation can create a new warning. If saving fails, the warning and cancellation proof remain.
+
 ## Performance system
 
 The activation benchmark runs a small, bounded MLX matrix workload on every

@@ -25,7 +25,7 @@ Bias tensors are dropped (t5 is always symmetric: dq = scale*(q-1)).
 Usage
 -----
     # Recommended: name the output to make the format explicit
-    python tools/repack_ternary_t5.py \\
+    python scripts/repack_ternary_t5.py \\
         --model /path/to/Bonsai-27B-mlx-2bit \\
         --output /path/to/Bonsai-27B-mlx-t5 \\
         [--group-size 128]  # default: auto-detect from config.json
@@ -40,7 +40,7 @@ The output directory will contain:
 Validation
 ----------
 After repacking, run:
-    python tools/repack_ternary_t5.py --verify \\
+    python scripts/repack_ternary_t5.py --verify \\
         --model /path/to/2bit-mlx-model \\
         --t5-model /path/to/t5-model \\
         --atol 1e-4

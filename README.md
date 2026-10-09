@@ -10,10 +10,6 @@
 <p align="center"><b>LLM inference, optimized for your Mac</b><br>Continuous batching and tiered KV caching, managed directly from your menu bar.</p>
 
 <p align="center">
-<a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
-</p>
-
-<p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
@@ -170,7 +166,7 @@ headroom-aware execution tuning, activation, and a live shard/performance map
 on both Macs. Interactive, balanced, and throughput profiles expose coalesced
 batching, prompt-cache affinity, rotating-KV limits, Ring connection tuning,
 and a capability-gated experimental token-only output path. See
-[Distributed inference across Macs](docs/distributed-cluster.md) for setup,
+[Distributed inference across Macs](docs/experimental/distributed-cluster.md) for setup,
 security boundaries, current limitations, and the physical-hardware validation
 checklist.
 

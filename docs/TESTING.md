@@ -27,9 +27,7 @@ CI runs all default tests on Python 3.11 for PRs and pushes to `main`. A daily s
 The automatic Qwen FP16/BF16 decode route has numerical, cache-state and
 fallback tests in `tests/test_qwen35_fp16_decode.py`. Run it with
 `tests/test_qwen35_gdn_prework.py` to check that the existing BF16 Qwen4 and
-speculative routes remain intact. See
-[GDN decode prework](experimental/qwen35_fp16_decode.md) for the hardware, geometry
-limits and real-model benchmark requirements.
+speculative routes remain intact.
 
 # First-token burst release
 
@@ -77,8 +75,6 @@ Run `python -m pytest -q tests/test_qwen4_qsa_reserved_capacity.py` to check QSA
 The integration tests cover restored-prefix lengths with boundary snapshots enabled and disabled, the first allocation after cache restoration, and prefill/decode output equivalence using a small Qwen4 model.
 
 Related regression suites are `test_qwen4_qsa_incremental_cache.py`, `test_qwen4_qsa_decode_gather.py`, and `test_prefill_oom_graceful.py`.
-
-For Qwen4 native sparse-GQA prefill measurements, run `python benchmarks/bench_qwen4_qsa_sparse_gqa.py --key-tokens 24576 --query-tokens 1024 --repetitions 30`. The benchmark reports index scoring, top-k selection, the combined native pipeline, every supported main-attention tile, the portable reference, and maximum error. Production groups native query rows into 4,096-row tiles through 32K keys, 2,048-row tiles through 64K, and 1,024-row tiles above 64K; this bounds the FP32 score sheet while amortizing per-tile dispatch.
 
 # Qwen4 verify attention row tests
 

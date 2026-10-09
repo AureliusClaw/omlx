@@ -63,8 +63,7 @@ chunk that touched it, evicting on the way. Over-capacity prefill is now
 chunked on expert boundaries instead — the routes are sorted by expert and
 each chunk holds every route of up to `capacity` distinct experts, the same
 shape as the DeepSeek V4.1 adapter's sorted prefill — so each expert is read
-at most once per layer per model call. Measured with
-`benchmarks/moe_offload_prefill_bench.py` on the same model (585-token
+at most once per layer per model call. Measured on the same model (585-token
 prompt, 32 decode tokens, single runs; warm = second identical request, cold
 = first request after load; filesystem page-cache state is not controlled).
 Fetch counts are sampled at the first yielded token and include the decode
@@ -197,7 +196,7 @@ exclude attention, Engram, and the rest of the forward.
 
 `Jundot/DeepSeek-V4.1-Flash-oQ3e-mtp` on an M5 Max with 128 GB and the
 internal SSD (`iogpu.wired_limit_mb` unset), Engram on SSD, native kernels
-built, run with `benchmarks/deepseek_v41_offload_bench.py` on a 433-token
+built, on a 433-token
 prose prompt in one prefill chunk followed by 64 greedy tokens. Single runs:
 
 | residency | experts per layer | load | Metal active | peak footprint | prefill | decode | decode hit rate |

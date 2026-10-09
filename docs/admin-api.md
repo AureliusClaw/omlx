@@ -91,7 +91,7 @@ curl -H "Authorization: Bearer $OMLX_API_KEY" http://127.0.0.1:8000/admin/api/st
 | `/admin/api/bench/accuracy/...` | Accuracy benchmark queue |
 | `/admin/api/bench/ane-tune/...` | ANE prefill tuning |
 
-Cluster endpoints are described in [distributed-cluster.md](distributed-cluster.md).
+Cluster endpoints are described in [distributed-cluster.md](experimental/distributed-cluster.md).
 
 ## Long-running tasks
 

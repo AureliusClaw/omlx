@@ -477,48 +477,7 @@ verification automatically when the pair is still unverified. The result is
 accepted only when both ranks answer and the measured large-payload rate clears
 the configured floor.
 
-[`benchmarks/heterogeneous_pool_probe.py`](../benchmarks/heterogeneous_pool_probe.py)
-remains a developer and recovery diagnostic. It has no oMLX server dependency;
-ordinary setup must not require it or a hand-written hostfile.
-
-Run it locally on each node:
-
-```bash
-python3 benchmarks/heterogeneous_pool_probe.py
-```
-
-Then make a Ring hostfile containing the Mac and every Spark and run:
-
-```bash
-mlx.launch \
-  --backend ring \
-  --hostfile /absolute/path/to/heterogeneous-hosts.json \
-  -- \
-  python3 benchmarks/heterogeneous_pool_probe.py \
-  --distributed \
-  --expect-ranks 6 \
-  --require-accelerators metal,cuda \
-  --cuda-supernode-ranks 4,5 \
-  --collective-mib 1,64
-```
-
-The developer probe verifies:
-
-- Metal and CUDA are both present in one Ring;
-- nominal MLX versions agree;
-- every rank completes representative 4-bit quantized matrix and BF16 attention
-  work;
-- cross-rank result spread remains within a declared tolerance;
-- small and large all-sums complete with measured timing;
-- proposed CUDA pair members are adjacent in the outer Ring and expose
-  NCCL.
-
-It deliberately does not call `RingGroup.split()` or report that measurement as
-NCCL. Ring subgroup support is version-dependent and, even where supported,
-would still measure Ring. Direct ConnectX admission belongs to the dashboard's
-separate NCCL verifier.
-
-Passing this diagnostic is necessary but not sufficient. The dashboard must
+Passing this verification is necessary but not sufficient. The dashboard must
 then pass the real unequal pipeline smoke, a small downloaded model, and the
 intended large model before hierarchical gateway execution is enabled.
 

@@ -10,10 +10,6 @@
 <p align="center"><b>Mac에 최적화된 LLM 추론 서버</b><br>Continuous Batching과 다단계 KV 캐시로 최적화된 추론 서버를, 메뉴바에서 편리하게</p>
 
 <p align="center">
-<a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
-</p>
-
-<p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
@@ -170,7 +166,7 @@ Apple Silicon에서 텍스트 LLM, 비전-언어 모델(VLM), OCR 모델, 임베
 balanced, throughput 프로파일에서 coalesced 배칭, 프롬프트 캐시 어피니티, 회전 KV
 한도, Ring 연결 튜닝, 그리고 기능 게이트가 적용된 실험적 토큰 전용 출력 경로를
 설정할 수 있습니다. 설정 방법, 보안 경계, 현재 제약, 실제 하드웨어 검증 체크리스트는
-[Mac 간 분산 추론](docs/distributed-cluster.md)을 참조하세요.
+[Mac 간 분산 추론](docs/experimental/distributed-cluster.md)을 참조하세요.
 
 ### 비전-언어 모델
 
