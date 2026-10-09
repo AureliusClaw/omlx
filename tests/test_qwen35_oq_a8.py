@@ -16,6 +16,8 @@ the classification logic are exercised regardless.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -391,6 +393,18 @@ def _quantized_linear(in_dim, out_dim, bits, group_size=GROUP_SIZE):
     return linear
 
 
+def _opt_in(obj, min_tokens=128):
+    """Tag ``obj`` (and its submodules) the way an enabled model is tagged."""
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    config = dispatch.OqA8Config(min_tokens=min_tokens)
+    for module in obj.modules() if isinstance(obj, nn.Module) else [obj]:
+        setattr(module, dispatch._CONFIG_ATTR, config)
+    return obj
+
+
 @requires_kernels
 def test_classification_is_frozen_and_memoized():
     """The forward path must never re-parse quantization config."""
@@ -424,12 +438,8 @@ def test_dispatch_runs_and_tracks_the_original(monkeypatch, variant):
     """oq_a8_linear must actually route to the kernel, not fall back."""
     from omlx.patches import qwen35_oq_a8 as dispatch
 
-    monkeypatch.setenv("OMLX_OQ_A8", "1")
-    monkeypatch.setenv("OMLX_OQ_A8_VARIANT", str(variant))
-    monkeypatch.setenv("OMLX_OQ_A8_MIN_TOKENS", "64")
-    assert dispatch.enabled()
-
-    linear = _quantized_linear(512, 128, 4)
+    monkeypatch.setattr(dispatch, "_DEFAULT_VARIANT_Q4", variant)
+    linear = _opt_in(_quantized_linear(512, 128, 4), min_tokens=64)
     plan = dispatch.classify_linear(linear)
     assert plan is not None and plan.variant == variant
 
@@ -497,12 +507,11 @@ def test_group_size_128_is_not_claimed(bits):
     assert dispatch.classify_linear(linear) is None
 
 
-def test_disabled_without_opt_in(monkeypatch):
+def test_disabled_without_opt_in():
     """Turning this on changes inference numerics, so it must be explicit."""
     from omlx.patches import qwen35_oq_a8 as dispatch
 
-    monkeypatch.delenv("OMLX_OQ_A8", raising=False)
-    assert dispatch.enabled() is False
+    assert dispatch._config_for(_quantized_linear(256, 128, 4)) is None
 
 
 # --------------------------------------------------------------------------
@@ -782,52 +791,16 @@ def test_batched_prefill_keeps_sequences_independent(B):
 
 
 @requires_kernels
-def test_short_sequences_stay_on_the_existing_path(monkeypatch):
+def test_short_sequences_stay_on_the_existing_path():
     """Below the token floor the Stage-A pass costs more than the GEMM saves."""
     from omlx.patches import qwen35_oq_a8 as dispatch
 
-    monkeypatch.setenv("OMLX_OQ_A8", "1")
-    monkeypatch.setenv("OMLX_OQ_A8_MIN_TOKENS", "512")
-    linear = _quantized_linear(512, 128, 4)
+    linear = _opt_in(_quantized_linear(512, 128, 4), min_tokens=512)
     rng = np.random.default_rng(9)
     x = mx.array((rng.standard_normal((64, 512)) * 0.5).astype(np.float32), mx.float16)
     got = dispatch.oq_a8_linear(linear, x)
     mx.eval(got)
     # Bit-identical to the unrouted call, i.e. it really did fall through.
-    np.testing.assert_array_equal(
-        np.array(got.astype(mx.float32)), np.array(linear(x).astype(mx.float32))
-    )
-
-
-def test_out_of_family_variants_are_rejected():
-    """A variant outside the shipped family has to fail where it enters.
-
-    The number arrives from an environment variable, so an out-of-range one
-    otherwise reaches the op as a missing kernel name deep in dispatch.
-    """
-    from omlx.patches import qwen35_oq_a8 as dispatch
-
-    for variant in (800, 803, 806):
-        assert dispatch.check_variant(variant) == variant
-    for variant in (0, 6, 206, 799, 807, -1):
-        with pytest.raises(ValueError, match="not a shipped kernel"):
-            dispatch.check_variant(variant)
-
-
-@requires_kernels
-def test_an_unusable_variant_leaves_the_projection_alone(monkeypatch):
-    """Refusing to classify keeps the model on MLX rather than crashing it."""
-    from omlx.patches import qwen35_oq_a8 as dispatch
-
-    monkeypatch.setenv("OMLX_OQ_A8", "1")
-    monkeypatch.setenv("OMLX_OQ_A8_VARIANT", "807")
-    linear = _quantized_linear(512, 128, 4)
-    assert dispatch.classify_linear(linear) is None
-
-    rng = np.random.default_rng(4)
-    x = mx.array((rng.standard_normal((128, 512)) * 0.5).astype(np.float32), mx.float16)
-    got = dispatch.oq_a8_linear(linear, x)
-    mx.eval(got)
     np.testing.assert_array_equal(
         np.array(got.astype(mx.float32)), np.array(linear(x).astype(mx.float32))
     )
@@ -851,9 +824,6 @@ def test_patched_mlp_routes_and_falls_back(monkeypatch):
 
     from omlx.patches import qwen35_oq_a8 as dispatch
 
-    monkeypatch.setenv("OMLX_OQ_A8", "1")
-    monkeypatch.setenv("OMLX_OQ_A8_MIN_TOKENS", "128")
-
     class MLP(nn.Module):
         def __init__(self):
             super().__init__()
@@ -866,7 +836,7 @@ def test_patched_mlp_routes_and_falls_back(monkeypatch):
 
     monkeypatch.setattr(dispatch, "_SWIGLU", lambda g, u: nn.silu(g) * u)
 
-    mlp = MLP()
+    mlp = _opt_in(MLP(), min_tokens=128)
     orig = MLP.__call__
     MLP.__call__ = dispatch._make_patched_mlp(orig)
 
@@ -899,18 +869,12 @@ def test_patched_mlp_routes_and_falls_back(monkeypatch):
 
 
 @requires_kernels
-def test_patch_takes_its_configuration_from_the_caller(monkeypatch):
+def test_patch_takes_its_configuration_from_the_caller():
     """The engine passes the model's settings in, rather than via the process
     environment, so two engines cannot silently reconfigure each other."""
     import mlx.nn as nn
 
     from omlx.patches import qwen35_oq_a8 as dispatch
-
-    monkeypatch.delenv("OMLX_OQ_A8", raising=False)
-    monkeypatch.delenv("OMLX_OQ_A8_VARIANT", raising=False)
-    monkeypatch.delenv("OMLX_OQ_A8_MIN_TOKENS", raising=False)
-
-    assert dispatch._variant_for_bits(4) == dispatch._DEFAULT_VARIANT_Q4
 
     class Model(nn.Module):
         def __init__(self):
@@ -920,25 +884,15 @@ def test_patch_takes_its_configuration_from_the_caller(monkeypatch):
     model = Model()
     dispatch.apply_qwen35_oq_a8_patch(model, min_tokens=2048)
     config = dispatch._config_for(model.proj)
-    assert config is not None and dispatch._min_tokens(config) == 2048
-
-    # An untouched model keeps the default, i.e. the floor rides on the model
-    # rather than on the process.
-    assert dispatch._min_tokens(dispatch._ENV_CONFIG) == dispatch._MIN_TOKENS_DEFAULT
+    assert config is not None and config.min_tokens == 2048
 
     # Q4 and Q5 are tuned independently; the tile is not a user setting.
     assert dispatch._variant_for_bits(4) == dispatch._DEFAULT_VARIANT_Q4
     assert dispatch._variant_for_bits(5) == dispatch._DEFAULT_VARIANT_Q5
 
-    # The environment still wins, for benchmarking.
-    monkeypatch.setenv("OMLX_OQ_A8_VARIANT", "801")
-    assert dispatch._variant_for_bits(4) == 801
-    monkeypatch.setenv("OMLX_OQ_A8_MIN_TOKENS", "64")
-    assert dispatch._min_tokens(config) == 64
-
 
 @requires_kernels
-def test_turning_the_setting_off_actually_stops_routing(monkeypatch):
+def test_turning_the_setting_off_actually_stops_routing():
     """Enable, then reload with the setting off: the second model must run on
     MLX.
 
@@ -950,9 +904,6 @@ def test_turning_the_setting_off_actually_stops_routing(monkeypatch):
     import mlx.nn as nn
 
     from omlx.patches import qwen35_oq_a8 as dispatch
-
-    monkeypatch.delenv("OMLX_OQ_A8", raising=False)
-    monkeypatch.setenv("OMLX_OQ_A8_MIN_TOKENS", "64")
 
     class Model(nn.Module):
         def __init__(self):
@@ -989,14 +940,11 @@ def test_turning_the_setting_off_actually_stops_routing(monkeypatch):
 
 
 @requires_kernels
-def test_two_resident_models_keep_their_own_settings(monkeypatch):
+def test_two_resident_models_keep_their_own_settings():
     """The wrapper is shared, so the floors must not be last-writer-wins."""
     import mlx.nn as nn
 
     from omlx.patches import qwen35_oq_a8 as dispatch
-
-    monkeypatch.delenv("OMLX_OQ_A8", raising=False)
-    monkeypatch.delenv("OMLX_OQ_A8_MIN_TOKENS", raising=False)
 
     class Model(nn.Module):
         def __init__(self):
@@ -1007,8 +955,8 @@ def test_two_resident_models_keep_their_own_settings(monkeypatch):
     dispatch.apply_qwen35_oq_a8_patch(short, min_tokens=64)
     dispatch.apply_qwen35_oq_a8_patch(long, min_tokens=4096)
 
-    assert dispatch._min_tokens(dispatch._config_for(short.proj)) == 64
-    assert dispatch._min_tokens(dispatch._config_for(long.proj)) == 4096
+    assert dispatch._config_for(short.proj).min_tokens == 64
+    assert dispatch._config_for(long.proj).min_tokens == 4096
 
 
 @pytest.mark.parametrize("batch", [1, 4])
@@ -1017,13 +965,12 @@ def test_single_token_mlp_stays_on_decode_when_floor_is_one(monkeypatch, batch):
 
     from omlx.patches import qwen35_oq_a8 as dispatch
 
-    monkeypatch.setenv("OMLX_OQ_A8_MIN_TOKENS", "1")
     route = Mock(side_effect=AssertionError("decode entered A8"))
     monkeypatch.setattr(dispatch, "oq_a8_mlp", route)
     original = Mock(return_value="decode")
     wrapped = dispatch._make_patched_mlp(original)
     x = mx.zeros((batch, 1, 64), dtype=mx.float16)
-    assert wrapped(object(), x) == "decode"
+    assert wrapped(_opt_in(SimpleNamespace(), min_tokens=1), x) == "decode"
     route.assert_not_called()
     assert not dispatch._shape_eligible(x, dispatch.OqA8Config(min_tokens=1))
     assert dispatch._shape_eligible(
@@ -1052,7 +999,7 @@ def test_mlp_routing_errors_are_not_silently_ignored(monkeypatch):
     monkeypatch.setattr(dispatch, "_SWIGLU", lambda g, u: g * u)
     wrapped = dispatch._make_patched_mlp(original)
     with pytest.raises(RuntimeError, match="kernel failure"):
-        wrapped(object(), mx.ones((1, 128, 64), dtype=mx.float16))
+        wrapped(_opt_in(SimpleNamespace()), mx.ones((1, 128, 64), dtype=mx.float16))
     original.assert_not_called()
 
 
@@ -1182,8 +1129,6 @@ def test_q8_mlp_shares_gate_up_stage_a(monkeypatch):
 
     from omlx.patches import qwen35_oq_a8 as dispatch
 
-    monkeypatch.setenv("OMLX_OQ_A8", "1")
-
     class MLP(nn.Module):
         def __init__(self):
             super().__init__()
@@ -1191,7 +1136,7 @@ def test_q8_mlp_shares_gate_up_stage_a(monkeypatch):
             self.up_proj = _quantized_linear(256, 512, 8)
             self.down_proj = _quantized_linear(512, 256, 8)
 
-    mlp = MLP()
+    mlp = _opt_in(MLP())
     x = mx.array(
         (np.random.default_rng(1).standard_normal((1, 256, 256)) * 0.4).astype(
             np.float32
@@ -1210,13 +1155,11 @@ def test_q8_mlp_shares_gate_up_stage_a(monkeypatch):
 
 
 @requires_kernels
-def test_mixed_stage_a_layouts_decline(monkeypatch):
+def test_mixed_stage_a_layouts_decline():
     """A Q4 gate with a Q8 up would need two Stage A layouts."""
     import mlx.nn as nn
 
     from omlx.patches import qwen35_oq_a8 as dispatch
-
-    monkeypatch.setenv("OMLX_OQ_A8", "1")
 
     class MLP(nn.Module):
         def __init__(self):
@@ -1226,7 +1169,7 @@ def test_mixed_stage_a_layouts_decline(monkeypatch):
             self.down_proj = _quantized_linear(512, 256, 4)
 
     x = mx.zeros((1, 256, 256), mx.float16)
-    assert dispatch.oq_a8_mlp(MLP(), x, lambda g, u: g * u) is None
+    assert dispatch.oq_a8_mlp(_opt_in(MLP()), x, lambda g, u: g * u) is None
 
 
 class _GatedDeltaProjections:
@@ -1242,8 +1185,7 @@ class _GatedDeltaProjections:
 def test_gdn_projections_share_one_stage_a(monkeypatch, bits):
     from omlx.patches import qwen35_oq_a8 as dispatch
 
-    monkeypatch.setenv("OMLX_OQ_A8", "1")
-    gdn = _GatedDeltaProjections(bits)
+    gdn = _opt_in(_GatedDeltaProjections(bits))
     x = mx.array(
         (np.random.default_rng(2).standard_normal((1, 256, 256)) * 0.5).astype(
             np.float32
@@ -1264,22 +1206,20 @@ def test_gdn_projections_share_one_stage_a(monkeypatch, bits):
 
 @requires_kernels
 @pytest.mark.parametrize("bits", [4, 8])
-def test_gdn_untiled_projection_declines_block(monkeypatch, bits):
+def test_gdn_untiled_projection_declines_block(bits):
     """in_proj_a/b are N=48 on Qwen3.8; one untiled projection declines the block."""
     from omlx.patches import qwen35_oq_a8 as dispatch
 
-    monkeypatch.setenv("OMLX_OQ_A8", "1")
-    gdn = _GatedDeltaProjections(bits, n_ab=48)
+    gdn = _opt_in(_GatedDeltaProjections(bits, n_ab=48))
     assert (
         dispatch.oq_a8_gdn_projections(gdn, mx.zeros((1, 256, 256), mx.float16)) is None
     )
 
 
 @requires_kernels
-def test_stage_a_layout_mismatch_raises(monkeypatch):
+def test_stage_a_layout_mismatch_raises():
     from omlx.patches import qwen35_oq_a8 as dispatch
 
-    monkeypatch.setenv("OMLX_OQ_A8", "1")
     linear = _quantized_linear(256, 128, 8)
     plan = dispatch.classify_linear(linear)
     x = mx.zeros((64, 256), mx.float16)
@@ -1288,12 +1228,10 @@ def test_stage_a_layout_mismatch_raises(monkeypatch):
 
 
 @requires_kernels
-def test_q8_standalone_route_and_fallback(monkeypatch):
+def test_q8_standalone_route_and_fallback():
     from omlx.patches import qwen35_oq_a8 as dispatch
 
-    monkeypatch.setenv("OMLX_OQ_A8", "1")
-    monkeypatch.setenv("OMLX_OQ_A8_MIN_TOKENS", "128")
-    linear = _quantized_linear(256, 128, 8)
+    linear = _opt_in(_quantized_linear(256, 128, 8), min_tokens=128)
     x = mx.array(
         (np.random.default_rng(6).standard_normal((1, 256, 256)) * 0.5).astype(
             np.float32

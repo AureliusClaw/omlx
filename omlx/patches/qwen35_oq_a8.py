@@ -3,14 +3,13 @@
 
 Eligible Q4/Q5/Q8 projections cache a dispatch plan and share activation
 quantization where possible. Class wrappers are installed once, but only
-modules tagged by an enabled model are routed. Environment overrides also
-support direct callers. Importing this module installs no patches.
+modules tagged by an enabled model are routed. Importing this module installs
+no patches.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,10 +25,6 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_BITS = frozenset((4, 5, 8))
 _GROUP_SIZE = 64
 
-# Variant-rejection messages already logged, so a bad environment variable
-# warns once rather than once per projection.
-_WARNED_VARIANTS: set[str] = set()
-
 _PLAN_ATTR = "_omlx_oq_a8_plan"
 _PREPARED_ATTR = "_omlx_oq_a8_prepared"
 
@@ -37,17 +32,6 @@ _PREPARED_ATTR = "_omlx_oq_a8_prepared"
 # Rowwise and GS64 activation scaling are supported independently per bit width.
 _ACT_MODE_ROW = 0
 _ACT_MODE_G64 = 1
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
-        return default
 
 
 # Prefill shorter than this stays on the existing path, where Stage A costs
@@ -66,32 +50,10 @@ class OqA8Config:
     min_tokens: int = _MIN_TOKENS_DEFAULT
 
 
-# Opting in without a settings object or a tagged model -- benchmarks, tests,
-# and anything driving the dispatcher directly.
-_ENV_CONFIG = OqA8Config()
-
-
-def enabled() -> bool:
-    """True when the process-wide environment opt-in is on and the kernels run.
-
-    This is the ``OMLX_OQ_A8`` hook only. Whether a *model* is routed is a
-    per-module question -- see :func:`_config_for`.
-    """
-    if os.environ.get("OMLX_OQ_A8") != "1":
-        return False
-    return _kernels_available()
-
-
 def _config_for(module: Any) -> OqA8Config | None:
-    """Resolve model-local configuration, with an optional environment override."""
-    if os.environ.get("OMLX_OQ_A8") == "0":
-        return None
+    """The configuration of the model that tagged ``module``, if any."""
     config = getattr(module, _CONFIG_ATTR, None)
-    if config is None:
-        if os.environ.get("OMLX_OQ_A8") != "1":
-            return None
-        config = _ENV_CONFIG
-    return config if _kernels_available() else None
+    return config if config is not None and _kernels_available() else None
 
 
 def _tag_modules(model: Any, config: OqA8Config) -> int:
@@ -153,9 +115,7 @@ def _act_mode_for_bits(bits: int) -> int:
         # GS64 scaling keeps activation outliers from setting the scale of a
         # whole row.
         return _ACT_MODE_G64
-    if bits == 5:
-        return _env_int("OMLX_OQ_A8_Q5_ACT_MODE", _ACT_MODE_ROW)
-    return _env_int("OMLX_OQ_A8_Q4_ACT_MODE", _ACT_MODE_ROW)
+    return _ACT_MODE_ROW
 
 
 # Q4/Q5 read Qa in Stage A v8's permuted K order. A Q8 byte is a whole code, so
@@ -176,38 +136,14 @@ _DEFAULT_VARIANT_Q4 = 806
 _DEFAULT_VARIANT_Q5 = 800
 _DEFAULT_VARIANT_Q8 = 806
 
-# The only family the kernels carry. A variant outside it names no kernel, so
-# it is refused where it enters rather than at the op boundary.
 _VARIANT_MIN = 800
-_VARIANT_MAX = 806
 
 
 def _variant_for_bits(bits: int) -> int:
     # Q4 and Q5 are autotuned independently: Q5 reads a second plane per
     # weight row and costs more registers, so the best tile need not match.
-    default = {5: _DEFAULT_VARIANT_Q5, 8: _DEFAULT_VARIANT_Q8}.get(
+    return {5: _DEFAULT_VARIANT_Q5, 8: _DEFAULT_VARIANT_Q8}.get(
         bits, _DEFAULT_VARIANT_Q4
-    )
-    shared = _env_int("OMLX_OQ_A8_VARIANT", default)
-    if bits == 8:
-        return shared
-    if bits == 5:
-        return _env_int("OMLX_OQ_A8_Q5_VARIANT", shared)
-    return _env_int("OMLX_OQ_A8_Q4_VARIANT", shared)
-
-
-def check_variant(variant: int) -> int:
-    """Return ``variant`` if a kernel exists for it, else raise.
-
-    Settings files and environment variables are both untrusted here: an
-    out-of-family number is an error at this boundary rather than a
-    missing-kernel failure deep inside the op.
-    """
-    if _VARIANT_MIN <= variant <= _VARIANT_MAX:
-        return variant
-    raise ValueError(
-        f"oQ A8 variant {variant} is not a shipped kernel; use "
-        f"{_VARIANT_MIN}-{_VARIANT_MAX}."
     )
 
 
@@ -264,21 +200,11 @@ def _classify_uncached(linear: Any) -> OqA8Plan | None:
 
 
 def _plan_for(bits: int, n: int, packed: bool = False) -> OqA8Plan | None:
-    try:
-        variant = check_variant(_variant_for_bits(bits))
-    except ValueError as exc:
-        # Once per distinct message: this runs for every eligible projection
-        # in the model, and a bad OMLX_OQ_A8_VARIANT is bad for all of them.
-        message = str(exc)
-        if message not in _WARNED_VARIANTS:
-            _WARNED_VARIANTS.add(message)
-            logger.warning("oq_a8: %s; leaving these projections alone", message)
-        return None
     plan = OqA8Plan(
         bits=bits,
         group_size=_GROUP_SIZE,
         act_mode=_act_mode_for_bits(bits),
-        variant=variant,
+        variant=_variant_for_bits(bits),
         packed=packed,
     )
 
@@ -432,17 +358,12 @@ def oq_a8_linear(linear: Any, x: mx.array) -> mx.array:
 # stay on the existing path even where a caller does not flag them.
 
 
-def _min_tokens(config: OqA8Config) -> int:
-    # The environment still wins, for benchmarking.
-    return _env_int("OMLX_OQ_A8_MIN_TOKENS", config.min_tokens)
-
-
 def _shape_eligible(x: mx.array, config: OqA8Config) -> bool:
     # Decode is out of scope for version 1; the kernel is built for
     # prefill and the tiles start at 32 rows.
     if x.ndim < 2 or x.dtype not in (mx.float16, mx.bfloat16):
         return False
-    if x.shape[-2] <= 1 or x.shape[-2] < _min_tokens(config):
+    if x.shape[-2] <= 1 or x.shape[-2] < config.min_tokens:
         return False
     return x.shape[-1] % _GROUP_SIZE == 0
 
@@ -560,8 +481,13 @@ _SWIGLU = None
 def _make_patched_mlp(orig_call):
     def patched(self, x, *args, **kwargs):
         # Skip single-token decoding before probing kernels or importing SwiGLU.
-        config = getattr(self, _CONFIG_ATTR, None) or _ENV_CONFIG
-        if x.ndim < 3 or x.shape[-2] <= 1 or x.shape[-2] < _min_tokens(config):
+        config = getattr(self, _CONFIG_ATTR, None)
+        if (
+            config is None
+            or x.ndim < 3
+            or x.shape[-2] <= 1
+            or x.shape[-2] < config.min_tokens
+        ):
             return orig_call(self, x, *args, **kwargs)
         target_verify = bool(kwargs.get("target_verify", False))
         if args and isinstance(args[0], bool):
@@ -686,6 +612,6 @@ def apply_qwen35_oq_a8_patch(
             _MLP_PATCHED,
             _GDN_REGISTERED,
             tagged,
-            _min_tokens(config),
+            config.min_tokens,
         )
     return _MLP_PATCHED or _GDN_REGISTERED

@@ -1216,9 +1216,6 @@ def qwen35_moe_weighted_sum(
 
 # --- oQ mixed-bit QxA8 (Q4/Q5/Q8, GS64, affine) on the M5 tensor units ------
 
-OQ_A8_VARIANT = int(os.environ.get("OMLX_OQ_A8_VARIANT", "0"))
-OQ_A8_ACT_MODE = int(os.environ.get("OMLX_OQ_A8_ACT_MODE", "0"))
-
 
 def oq_a8_available() -> bool:
     """True when the INT8 NAX GEMM can actually run on this machine.
