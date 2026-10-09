@@ -8203,6 +8203,7 @@ async def stream_responses_api(
     last_output = None
     accumulated_text = ""
     accumulated_reasoning = ""
+    message_deltas = []
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
@@ -8490,6 +8491,7 @@ async def stream_responses_api(
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
+                        message_deltas.append(content_delta)
                         seq = stream_state.next_sequence()
                         yield format_sse_event(
                             "response.output_text.delta",
@@ -8559,6 +8561,7 @@ async def stream_responses_api(
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
             if content_delta:
+                message_deltas.append(content_delta)
                 seq = stream_state.next_sequence()
                 yield format_sse_event(
                     "response.output_text.delta",
@@ -8579,6 +8582,7 @@ async def stream_responses_api(
                         yield ev
                 for ev in _open_message():
                     yield ev
+                message_deltas.append(remaining)
                 seq = stream_state.next_sequence()
                 yield format_sse_event(
                     "response.output_text.delta",
@@ -8626,6 +8630,7 @@ async def stream_responses_api(
         if not stream_content and cleaned_text:
             for ev in _open_message():
                 yield ev
+            message_deltas.append(cleaned_text)
             seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.output_text.delta",
@@ -8665,6 +8670,7 @@ async def stream_responses_api(
                     yield ev
             for ev in _open_message():
                 yield ev
+            message_deltas.append(recovered_content)
             seq = stream_state.next_sequence()
             yield format_sse_event(
                 "response.output_text.delta",
@@ -8690,11 +8696,16 @@ async def stream_responses_api(
                 except (json.JSONDecodeError, AttributeError):
                     pass
 
-    final_text = cleaned_text.strip() if cleaned_text else ""
+    # Final message content must preserve the bytes already emitted to clients.
+    final_text = "".join(message_deltas)
 
     # Process response_format if specified
     if response_format and not tool_calls:
-        final_text, _, is_valid, error = parse_json_output(final_text, response_format)
+        json_text, _, is_valid, error = parse_json_output(final_text, response_format)
+        # Unconstrained output can wrap the JSON in prose or a code fence.
+        # Strip those so clients can parse the final text as JSON.
+        if json_text != final_text.strip():
+            final_text = json_text
         if not is_valid:
             logger.warning(f"JSON validation failed: {error}")
 
