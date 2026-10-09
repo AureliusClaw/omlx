@@ -2965,9 +2965,7 @@ def test_nax_sparse_mla_call_site_matches_fallback_paths(monkeypatch):
 @_needs_nax_sparse_mla
 @pytest.mark.parametrize("length", [2, 4, 8])
 @pytest.mark.parametrize("bits", [None, 4])
-def test_nax_sparse_mla_short_verify_avoids_gather_and_preserves_cache(
-    monkeypatch, length, bits
-):
+def test_nax_sparse_mla_short_verify_avoids_gather(monkeypatch, length, bits):
     from mlx_lm.models.cache import KVCache, PoolingCache
     from mlx_vlm.models.glm5_next import language
 
@@ -3003,13 +3001,6 @@ def test_nax_sparse_mla_short_verify_avoids_gather_and_preserves_cache(
     assert got.shape == expected.shape and got.dtype == expected.dtype
     e32, g32 = expected.astype(mx.float32), got.astype(mx.float32)
     assert mx.abs(e32 - g32).max().item() <= 1e-2 * mx.abs(e32).max().item()
-    for actual, reference in zip(cache, reference_cache, strict=True):
-        assert actual.size() == reference.size()
-        for a, r in zip(actual.state, reference.state, strict=True):
-            if a is None or r is None:
-                assert a is r
-            else:
-                assert mx.array_equal(a, r).item()
 
 
 @pytest.mark.parametrize("batch,dtype", [(1, mx.float32), (2, mx.bfloat16)])

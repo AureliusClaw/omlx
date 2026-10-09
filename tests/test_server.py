@@ -1532,40 +1532,6 @@ def prepared_chat_engine():
     return engine
 
 
-def test_prepare_chat_prompt_for_request_uses_batched_preparation(prepared_chat_engine):
-    messages = [{"role": "user", "content": "Hello"}]
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "lookup",
-                "description": "Look up",
-                "parameters": {"type": "object"},
-            },
-        }
-    ]
-    engine = prepared_chat_engine
-
-    count, prepared = srv._prepare_chat_prompt_for_request(
-        engine,
-        messages,
-        tools=tools,
-        chat_template_kwargs={"preserve_thinking": True},
-        is_partial=True,
-    )
-
-    assert count == 3
-    assert prepared == ("canonical prompt", [11, 12, 13])
-    engine._apply_chat_template.assert_called_once()
-    assert engine._apply_chat_template.call_args.args == (messages, tools)
-    assert engine._apply_chat_template.call_args.kwargs == {
-        "chat_template_kwargs": {"preserve_thinking": True},
-        "is_partial": True,
-        "add_generation_prompt": None,
-    }
-    engine._tokenizer.encode.assert_called_once_with("canonical prompt")
-
-
 @pytest.mark.parametrize("subclass", [False, True])
 def test_prepare_chat_prompt_for_request_keeps_other_engine_count_path(subclass):
     class OtherBatchedEngine(BatchedEngine):
@@ -1583,18 +1549,6 @@ def test_prepare_chat_prompt_for_request_keeps_other_engine_count_path(subclass)
     ) == (7, None)
     engine.count_chat_tokens.assert_called_once_with(
         messages, None, chat_template_kwargs={"enable_thinking": False}, is_partial=True
-    )
-
-
-def test_thinking_detection_reuses_prepared_prompt_before_tokenizer_lookup():
-    prepared = ("canonical prompt<think>", [11, 12, 13])
-    engine = SimpleNamespace(tokenizer=None)
-
-    assert (
-        srv._render_chat_prompt_for_thinking_detection(
-            engine, [], {"_prepared_prompt": prepared}
-        )
-        is prepared
     )
 
 

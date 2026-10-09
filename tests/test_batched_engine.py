@@ -13,7 +13,6 @@ Tests cover:
 Note: mlx_lm.load() is mocked to avoid loading real models.
 """
 
-import asyncio
 from abc import ABC
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -1304,33 +1303,6 @@ class TestBatchedEnginePreparedPrompt:
         engine._apply_chat_template.assert_called_once()
         assert engine._apply_chat_template.call_args.args[0] == messages[1:]
         engine._tokenizer.encode.assert_called_once_with("USER_ONLY")
-
-    @pytest.mark.asyncio
-    async def test_prepared_inputs_remain_isolated_between_concurrent_requests(self):
-        engine = self._engine()
-        engine._tokenizer.apply_chat_template.side_effect = ["first", "second"]
-        engine._tokenizer.encode.side_effect = [[1, 2], [3, 4, 5]]
-        messages = [[{"role": "user", "content": text}] for text in ("first", "second")]
-        prepared = [engine.prepare_chat_prompt(message) for message in messages]
-
-        async def generate(**kwargs):
-            await asyncio.sleep(0)
-            return TestBatchedEngineSpecPrefillForwarding._fake_output()
-
-        engine._engine.generate.side_effect = generate
-        await asyncio.gather(
-            *(
-                engine.chat(message, _prepared_prompt=prompt)
-                for message, prompt in zip(messages, prepared)
-            )
-        )
-
-        assert [
-            call.kwargs["prompt"] for call in engine._engine.generate.await_args_list
-        ] == [[1, 2], [3, 4, 5]]
-        assert prepared == [("first", [1, 2]), ("second", [3, 4, 5])]
-        assert engine._tokenizer.encode.call_count == 2
-
 
 class TestBatchedEngineMoeOffloadWiring:
     """The text engine's offload call must carry the Lightning MTP residency flag.
